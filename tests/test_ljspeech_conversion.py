@@ -2,9 +2,13 @@ import json
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest.mock import patch
 import wave
 from pathlib import Path
+
+from tools.prepare_ljspeech import wav_duration
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "prepare_ljspeech.py"
 
@@ -18,6 +22,14 @@ def write_wav(path: Path) -> None:
 
 
 class ConversionTests(unittest.TestCase):
+    def test_extensible_wav_duration_uses_soundfile_fallback(self):
+        fake_soundfile = types.SimpleNamespace(
+            info=lambda _path: types.SimpleNamespace(frames=48000, samplerate=24000)
+        )
+        with patch("tools.prepare_ljspeech.wave.open", side_effect=wave.Error("unknown format: 65534")):
+            with patch.dict(sys.modules, {"soundfile": fake_soundfile}):
+                self.assertEqual(wav_duration(Path("extensible.wav")), 2.0)
+
     def test_two_column_filename_with_suffix_and_atomic_failure(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder) / "voice 中文"

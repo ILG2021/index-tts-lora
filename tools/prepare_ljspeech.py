@@ -11,8 +11,24 @@ from pathlib import Path, PurePosixPath
 
 
 def wav_duration(path: Path) -> float:
-    with wave.open(str(path), "rb") as wav_file:
-        return wav_file.getnframes() / float(wav_file.getframerate())
+    try:
+        with wave.open(str(path), "rb") as wav_file:
+            return wav_file.getnframes() / float(wav_file.getframerate())
+    except (wave.Error, EOFError):
+        # Python 3.10's wave module cannot read WAVE_FORMAT_EXTENSIBLE (65534),
+        # which is common in 24-bit/multichannel files exported by audio tools.
+        try:
+            import soundfile
+
+            info = soundfile.info(str(path))
+        except (ImportError, RuntimeError) as error:
+            raise RuntimeError(
+                f"Cannot read WAV metadata for {path}. Install soundfile or convert "
+                "the file to PCM WAV (mono, 16/24-bit)."
+            ) from error
+        if info.frames <= 0 or info.samplerate <= 0:
+            raise ValueError(f"Audio has invalid frame count/sample rate: {path}")
+        return info.frames / float(info.samplerate)
 
 
 def parse_audio_reference(value: str, line_number: int) -> tuple[PurePosixPath, str]:
