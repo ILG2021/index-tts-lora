@@ -89,6 +89,38 @@ class ConversionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(b"mixed two- and three-column", result.stderr)
 
+    def test_nested_audio_path_and_traversal_guard(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            nested = root / "wavs" / "speaker one"
+            nested.mkdir(parents=True)
+            write_wav(nested / "file0001.wav")
+            write_wav(nested / "file0002.wav")
+            metadata = root / "metadata.csv"
+            metadata.write_text(
+                "speaker one/file0001.wav|text one\n"
+                "speaker one\\file0002.wav|text two\n",
+                encoding="utf-8",
+            )
+            output = root / "voice.jsonl"
+            command = [sys.executable, str(SCRIPT), "--dataset-dir", str(root),
+                       "--output", str(output)]
+            result = subprocess.run(command, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(Path(rows[0]["audio"]), nested / "file0001.wav")
+            self.assertNotIn("/", rows[0]["id"])
+            self.assertNotIn("\\", rows[0]["id"])
+            self.assertNotEqual(rows[0]["id"], rows[1]["id"])
+
+            previous = output.read_bytes()
+            metadata.write_text(
+                "speaker one/file0001.wav|one\n../outside.wav|two\n", encoding="utf-8"
+            )
+            result = subprocess.run(command, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(output.read_bytes(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()

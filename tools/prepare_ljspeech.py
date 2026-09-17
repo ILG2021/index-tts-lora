@@ -3,15 +3,44 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import wave
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 def wav_duration(path: Path) -> float:
     with wave.open(str(path), "rb") as wav_file:
         return wav_file.getnframes() / float(wav_file.getframerate())
+
+
+def parse_audio_reference(value: str, line_number: int) -> tuple[PurePosixPath, str]:
+    """Return a safe path relative to wavs/ and a filesystem-safe sample ID."""
+    normalized = value.strip().replace("\\", "/")
+    relative = PurePosixPath(normalized)
+    if (not normalized or relative.is_absolute() or normalized.startswith("//")
+            or any(part in ("", ".", "..") for part in relative.parts)):
+        raise ValueError(
+            f"metadata.csv line {line_number}: audio path must stay below wavs/: {value!r}"
+        )
+    for part in relative.parts:
+        if (re.search(r'[<>:"|?*\x00-\x1f]', part)
+                or part.endswith((".", " "))):
+            raise ValueError(
+                f"metadata.csv line {line_number}: invalid audio path component {part!r}"
+            )
+    if relative.suffix.lower() != ".wav":
+        raise ValueError(
+            f"metadata.csv line {line_number}: audio filename must end in .wav"
+        )
+    stem_path = relative.with_suffix("")
+    if len(stem_path.parts) == 1:
+        sample_id = stem_path.name
+    else:
+        digest = hashlib.sha1(relative.as_posix().casefold().encode("utf-8")).hexdigest()[:10]
+        sample_id = "__".join(stem_path.parts) + f"__{digest}"
+    return relative, sample_id
 
 
 def main() -> None:
@@ -49,23 +78,23 @@ def main() -> None:
                     f"metadata.csv line {line_number}: mixed two- and three-column rows"
                 )
             filename_field = row[0].strip()
-            if (not filename_field or filename_field in (".", "..")
-                    or re.search(r'[<>:"/\\|?*\x00-\x1f]', filename_field)
-                    or filename_field.endswith((".", " "))):
-                raise ValueError(
-                    f"metadata.csv line {line_number}: invalid filename/ID {filename_field!r}"
+            if len(row) == 2 or Path(filename_field).suffix:
+                relative_audio, sample_id = parse_audio_reference(filename_field, line_number)
+            else:
+                # Official three-column LJSpeech stores a bare ID in column one.
+                relative_audio, sample_id = parse_audio_reference(
+                    f"{filename_field}.wav", line_number
                 )
-            supplied_suffix = Path(filename_field).suffix
-            if supplied_suffix and supplied_suffix.lower() != ".wav":
-                raise ValueError(
-                    f"metadata.csv line {line_number}: audio filename must end in .wav"
-                )
-            audio_filename = filename_field if supplied_suffix else f"{filename_field}.wav"
-            sample_id = Path(audio_filename).stem
             if sample_id.casefold() in seen_ids:
                 raise ValueError(f"metadata.csv line {line_number}: duplicate sample ID {sample_id!r}")
             seen_ids.add(sample_id.casefold())
-            audio = (wav_dir / audio_filename).resolve()
+            audio = wav_dir.joinpath(*relative_audio.parts).resolve()
+            try:
+                audio.relative_to(wav_dir.resolve())
+            except ValueError as error:
+                raise ValueError(
+                    f"metadata.csv line {line_number}: audio path escaped wavs/"
+                ) from error
             text_index = 1 if len(row) == 2 or args.text_column == "raw" else 2
             text = " ".join(row[text_index].split())
             if not audio.is_file():
