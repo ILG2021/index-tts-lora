@@ -17,3 +17,8 @@ checkpoints/
 result/
 finetune_data/
 logs/
+vendor/
+datasets/
+processed_data/
+trained_ckpts/
+.reference-indextts2-finetuning/

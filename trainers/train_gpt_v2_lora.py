@@ -1,0 +1,1280 @@
+#!/usr/bin/env python3
+"""
+End-to-end LoRA fine-tuning entry point for the IndexTTS2 GPT module.
+
+This trainer expects the preprocessing pipeline to have produced manifests where each
+sample record stores paths to:
+  - text token ids (.npy, int32)
+  - semantic codes (.npy, int32)
+  - conditioning latent (.npy, float32 [32, hidden])
+  - emotion vector (.npy, float32 [hidden])
+
+The model is optimised with cross-entropy losses over text tokens and semantic codes,
+with optional gradient accumulation and mixed-precision support. Checkpoints are
+emitted every 1k optimiser steps (`model_step{N}.pth`) and at epoch boundaries.
+Snapshots are retained. TensorBoard summaries track losses and learning rate under the
+chosen output directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import importlib.metadata
+import inspect
+import json
+import math
+import os
+import random
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from index_resume_contract import (
+    aggregate_file_fingerprint,
+    regular_file_record,
+    resume_artifacts_path,
+    resolve_resume_checkpoint,
+    validate_recent_checkpoints,
+    verify_resume_checkpoint,
+    write_epoch_resume_metadata,
+)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+UPSTREAM_ROOT = PROJECT_ROOT / "vendor" / "index-tts"
+if not UPSTREAM_ROOT.is_dir():
+    raise RuntimeError("Missing vendor/index-tts. Run scripts/windows/setup.ps1 first.")
+sys.path.insert(0, str(UPSTREAM_ROOT))
+
+from indextts.gpt.model_v2 import UnifiedVoice
+from indextts.utils.front import TextNormalizer, TextTokenizer
+from omegaconf import OmegaConf
+from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
+from lora_state import validate_adapter_state
+from torch import nn
+from torch.nn.utils.rnn import pad_sequence
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
+from transformers import get_cosine_schedule_with_warmup
+
+
+def fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fine-tune IndexTTS2 GPT with LoRA.")
+    parser.add_argument(
+        "--train-manifest",
+        dest="train_manifests",
+        action="append",
+        type=str,
+        required=True,
+        help="Training manifest JSONL. Repeat to mix multiple datasets; optionally suffix with '::lang' to force a language hint.",
+    )
+    parser.add_argument(
+        "--val-manifest",
+        dest="val_manifests",
+        action="append",
+        type=str,
+        required=True,
+        help="Validation manifest JSONL. Repeat to mix multiple datasets; optionally suffix with '::lang' to force a language hint.",
+    )
+    parser.add_argument("--tokenizer", type=Path, required=True, help="SentencePiece model path.")
+    parser.add_argument("--config", type=Path, default=Path("checkpoints/config.yaml"), help="Model config YAML.")
+    parser.add_argument("--base-checkpoint", type=Path, default=Path("checkpoints/gpt.pth"), help="Base GPT checkpoint.")
+    parser.add_argument("--output-dir", type=Path, default=Path("trained_ckpts"), help="Directory for checkpoints/logs.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Mini-batch size per optimisation step.")
+    parser.add_argument("--grad-accumulation", type=int, default=1, help="Gradient accumulation steps.")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs.")
+    parser.add_argument("--learning-rate", type=float, default=2e-5, help="Initial learning rate.")
+    parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay.")
+    parser.add_argument("--warmup-steps", type=int, default=1000, help="LR warmup steps.")
+    parser.add_argument("--max-steps", type=int, default=0, help="Optional max optimiser steps (0 = unlimited).")
+    parser.add_argument("--log-interval", type=int, default=100, help="Steps between training log entries.")
+    parser.add_argument("--val-interval", type=int, default=0, help="Validation frequency in optimizer steps (0 = auto, once per epoch).")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clipping value.")
+    parser.add_argument("--text-loss-weight", type=float, default=0.2, help="Weight for text CE loss.")
+    parser.add_argument("--mel-loss-weight", type=float, default=0.8, help="Weight for semantic CE loss.")
+    parser.add_argument("--amp", action="store_true", help="Enable CUDA AMP.")
+    parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from, or 'auto'.")
+    parser.add_argument(
+        "--trust-resume-state",
+        action="store_true",
+        help="Acknowledge trusted local pickle-backed optimizer state before resume.",
+    )
+    parser.add_argument(
+        "--use-duration-control",
+        action="store_true",
+        help="Train GPT with duration embeddings derived from target semantic lengths.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help=(
+            "Require deterministic PyTorch CUDA algorithms and disable TF32. "
+            "This can reduce throughput and fails closed on unsupported kernels."
+        ),
+    )
+    parser.add_argument(
+        "--no-latest",
+        dest="write_latest",
+        action="store_false",
+        help=(
+            "Skip the legacy latest.pth compatibility copy. Named checkpoints "
+            "remain the guarded resume source."
+        ),
+    )
+    parser.set_defaults(write_latest=True)
+    parser.add_argument(
+        "--duration-dropout",
+        type=float,
+        default=0.3,
+        help="Probability of zeroing duration embeddings when --use-duration-control is enabled.",
+    )
+    parser.add_argument("--seed", type=int, default=1234, help="Random seed.")
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--lora-target-modules", default="c_attn,c_proj,c_fc",
+                        help="Comma-separated GPT module suffixes to adapt.")
+    return parser.parse_args()
+
+
+@dataclass
+class ManifestSpec:
+    path: Path
+    language: Optional[str] = None
+
+
+def parse_manifest_specs(entries: Sequence[str], flag_name: str) -> List[ManifestSpec]:
+    if not entries:
+        raise ValueError(f"{flag_name} requires at least one manifest path.")
+    specs: List[ManifestSpec] = []
+    for raw in entries:
+        value = raw.strip()
+        lang: Optional[str] = None
+        for separator in ("::", "@", "="):
+            if separator in value:
+                path_str, lang_part = value.rsplit(separator, 1)
+                value = path_str.strip()
+                lang = lang_part.strip().lower() or None
+                break
+        path = Path(value).expanduser()
+        specs.append(ManifestSpec(path=path, language=lang))
+    return specs
+
+
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    random.seed(seed)
+
+
+def configure_determinism(enabled: bool) -> None:
+    """Configure the strict CUDA controls required for byte-exact evidence."""
+    if not enabled:
+        return
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("highest")
+
+
+@dataclass
+class Sample:
+    id: str
+    text_ids_path: Path
+    codes_path: Path
+    condition_path: Path
+    emo_vec_path: Path
+    text_len: int
+    code_len: int
+    condition_len: int
+    sample_type: str = "single"
+    prompt_id: Optional[str] = None
+    target_id: Optional[str] = None
+    language: Optional[str] = None
+    prompt_language: Optional[str] = None
+    manifest_path: Optional[Path] = None
+
+
+class GPTPairDataset(Dataset):
+    def __init__(self, manifests: Sequence[ManifestSpec]):
+        if isinstance(manifests, ManifestSpec):
+            manifests = [manifests]
+        manifest_list = list(manifests)
+        if not manifest_list:
+            raise ValueError("No manifest paths supplied.")
+
+        self.samples: List[Sample] = []
+        self.sample_type: str = "unknown"
+        self.manifest_summaries: List[Dict[str, object]] = []
+        self.bad_indices: Set[int] = set()
+
+        for spec in manifest_list:
+            self._load_single_manifest(spec)
+
+        if not self.samples:
+            manifest_paths = ", ".join(str(spec.path) for spec in manifest_list)
+            raise RuntimeError(f"No entries found in the provided manifests: {manifest_paths}")
+        if self.sample_type != "paired":
+            raise RuntimeError(
+                "The GPT trainer expects prompt/target pair manifests.\n"
+                "Generate paired manifests with tools/build_gpt_prompt_pairs.py and retry."
+            )
+
+    @staticmethod
+    def _resolve_path(base_dir: Path, value: str) -> Path:
+        if not value:
+            raise ValueError("Empty path provided in manifest record.")
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        return (base_dir / path).expanduser()
+
+    @staticmethod
+    def _normalize_language(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped.lower() if stripped else None
+
+    def _load_single_manifest(self, spec: ManifestSpec) -> None:
+        manifest_path = spec.path
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+
+        local_count = 0
+        local_languages: set[str] = set()
+        manifest_sample_type: Optional[str] = None
+        base_dir = manifest_path.parent
+
+        print(f"[Info] Parsing manifest {manifest_path} ...")
+        processed = 0
+        progress_interval = 10000
+
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                processed += 1
+                is_paired = "prompt_condition_path" in record and "target_codes_path" in record
+                if is_paired:
+                    emo_path_value = record.get("prompt_emo_vec_path") or record.get("target_emo_vec_path")
+                    if not emo_path_value:
+                        raise RuntimeError(
+                            f"Paired manifest entry {record.get('id')} missing prompt_emo_vec_path."
+                        )
+                    target_language = self._normalize_language(
+                        record.get("target_language") or record.get("language") or spec.language
+                    )
+                    prompt_language = self._normalize_language(record.get("prompt_language") or spec.language)
+                    sample = Sample(
+                        id=record["id"],
+                        text_ids_path=self._resolve_path(base_dir, record["target_text_ids_path"]),
+                        codes_path=self._resolve_path(base_dir, record["target_codes_path"]),
+                        condition_path=self._resolve_path(base_dir, record["prompt_condition_path"]),
+                        emo_vec_path=self._resolve_path(base_dir, emo_path_value),
+                        text_len=int(record["target_text_len"]),
+                        code_len=int(record["target_code_len"]),
+                        condition_len=int(record.get("prompt_condition_len", 32)),
+                        sample_type="paired",
+                        prompt_id=record.get("prompt_id"),
+                        target_id=record.get("target_id"),
+                        language=target_language,
+                        prompt_language=prompt_language,
+                        manifest_path=manifest_path,
+                    )
+                else:
+                    language = self._normalize_language(record.get("language") or spec.language)
+                    sample = Sample(
+                        id=record["id"],
+                        text_ids_path=self._resolve_path(base_dir, record["text_ids_path"]),
+                        codes_path=self._resolve_path(base_dir, record["codes_path"]),
+                        condition_path=self._resolve_path(base_dir, record["condition_path"]),
+                        emo_vec_path=self._resolve_path(base_dir, record["emo_vec_path"]),
+                        text_len=int(record["text_len"]),
+                        code_len=int(record["code_len"]),
+                        condition_len=int(record.get("condition_len", 32)),
+                        sample_type="single",
+                        manifest_path=manifest_path,
+                        language=language,
+                    )
+
+                if manifest_sample_type is None:
+                    manifest_sample_type = sample.sample_type
+                elif manifest_sample_type != sample.sample_type:
+                    raise RuntimeError(
+                        f"Manifest {manifest_path} mixes sample types ({manifest_sample_type} vs {sample.sample_type})."
+                    )
+
+                self.samples.append(sample)
+                local_count += 1
+                if sample.language:
+                    local_languages.add(sample.language)
+                if sample.prompt_language:
+                    local_languages.add(sample.prompt_language)
+
+                if processed % progress_interval == 0:
+                    print(
+                        f"  • processed {processed:,} entries "
+                        f"(kept {local_count:,}) in {manifest_path.name}"
+                    )
+
+        if local_count:
+            if processed % progress_interval != 0:
+                print(
+                    f"  • processed {processed:,} entries "
+                    f"(kept {local_count:,}) in {manifest_path.name}"
+                )
+            if manifest_sample_type and manifest_sample_type != "paired":
+                raise RuntimeError(
+                    f"Manifest {manifest_path} contains '{manifest_sample_type}' entries. "
+                    "This trainer expects prompt/target pair manifests (see tools/build_gpt_prompt_pairs.py)."
+                )
+            if self.sample_type == "unknown":
+                self.sample_type = manifest_sample_type or "unknown"
+            elif manifest_sample_type and self.sample_type != manifest_sample_type:
+                raise RuntimeError(
+                    f"Mixed sample types encountered across manifests: {self.sample_type} vs {manifest_sample_type} (from {manifest_path})"
+                )
+
+            languages_display = sorted(local_languages)
+            if not languages_display and spec.language:
+                languages_display = [spec.language]
+            language_text = ", ".join(languages_display) if languages_display else "unspecified"
+            print(
+                f"[Info] Loaded {local_count} samples ({manifest_sample_type}) from {manifest_path} "
+                f"(languages: {language_text})"
+            )
+            self.manifest_summaries.append(
+                {"path": manifest_path, "count": local_count, "languages": languages_display}
+            )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        if not self.samples:
+            raise RuntimeError("Dataset is empty.")
+
+        if len(self.bad_indices) >= len(self.samples):
+            raise RuntimeError("All samples were marked invalid; cannot continue.")
+
+        attempts = 0
+        max_attempts = len(self.samples)
+        sample_count = len(self.samples)
+
+        while attempts < max_attempts:
+            current_idx = idx % sample_count
+
+            sample = self.samples[current_idx]
+            if sample is None:
+                idx += 1
+                attempts += 1
+                continue
+
+            try:
+                text_ids = np.load(sample.text_ids_path, allow_pickle=False)
+                codes = np.load(sample.codes_path, allow_pickle=False)
+                condition = np.load(sample.condition_path, allow_pickle=False)
+                emo_vec = np.load(sample.emo_vec_path, allow_pickle=False)
+
+                if text_ids.size == 0 or codes.size == 0 or condition.size == 0 or emo_vec.size == 0:
+                    raise ValueError("Encountered empty feature file.")
+
+                text_ids = text_ids.astype(np.int64, copy=False)
+                codes = codes.astype(np.int64, copy=False)
+                condition = condition.astype(np.float32, copy=False)
+                emo_vec = emo_vec.astype(np.float32, copy=False)
+
+                return {
+                    "id": sample.id,
+                    "text_ids": torch.from_numpy(text_ids),
+                    "codes": torch.from_numpy(codes),
+                    "condition": torch.from_numpy(condition),  # [cond_len, dim]
+                    "emo_vec": torch.from_numpy(emo_vec),
+                    "text_len": torch.tensor(sample.text_len, dtype=torch.long),
+                    "code_len": torch.tensor(sample.code_len, dtype=torch.long),
+                    "condition_len": torch.tensor(sample.condition_len, dtype=torch.long),
+                    "prompt_id": sample.prompt_id if sample.prompt_id else sample.id,
+                    "target_id": sample.target_id if sample.target_id else sample.id,
+                    "language": sample.language,
+                    "prompt_language": sample.prompt_language,
+                    "manifest_path": str(sample.manifest_path) if sample.manifest_path else "",
+                }
+
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                if current_idx not in self.bad_indices:
+                    message = (
+                        f"[Warn] Skipping sample '{sample.id}' due to load failure: {exc}. "
+                        "It will be removed from the dataset for this run."
+                    )
+                    print(message)
+                    self.bad_indices.add(current_idx)
+
+                self.samples[current_idx] = None
+                if len(self.bad_indices) >= len(self.samples):
+                    raise RuntimeError("All samples were marked invalid; cannot continue.")
+
+                idx = current_idx + 1
+                attempts += 1
+                continue
+
+        raise RuntimeError("Exceeded retry budget while sampling training data.")
+
+
+def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    text_tensors = [item["text_ids"] for item in batch]
+    code_tensors = [item["codes"] for item in batch]
+    condition_tensors = [item["condition"] for item in batch]
+    emo_tensors = [item["emo_vec"] for item in batch]
+
+    text_padded = pad_sequence(text_tensors, batch_first=True, padding_value=0)
+    code_padded = pad_sequence(code_tensors, batch_first=True, padding_value=0)
+    condition_stacked = torch.stack(condition_tensors, dim=0)
+    emo_stacked = torch.stack(emo_tensors, dim=0)
+
+    text_lengths = torch.stack([item["text_len"] for item in batch])
+    code_lengths = torch.stack([item["code_len"] for item in batch])
+    cond_lengths = torch.stack([item["condition_len"] for item in batch])
+
+    ids = [item["id"] for item in batch]
+    prompt_ids = [item.get("prompt_id", item["id"]) for item in batch]
+    target_ids = [item.get("target_id", item["id"]) for item in batch]
+    languages = [item.get("language") for item in batch]
+    prompt_languages = [item.get("prompt_language") for item in batch]
+    manifest_paths = [item.get("manifest_path") for item in batch]
+
+    return {
+        "ids": ids,
+        "prompt_ids": prompt_ids,
+        "target_ids": target_ids,
+        "text_ids": text_padded,
+        "codes": code_padded,
+        "condition": condition_stacked,
+        "emo_vec": emo_stacked,
+        "text_lengths": text_lengths,
+        "code_lengths": code_lengths,
+        "condition_lengths": cond_lengths,
+        "languages": languages,
+        "prompt_languages": prompt_languages,
+        "manifest_paths": manifest_paths,
+    }
+
+
+def load_tokenizer(tokenizer_path: Path) -> TextTokenizer:
+    normalizer = TextNormalizer()
+    tokenizer = TextTokenizer(str(tokenizer_path), normalizer)
+    return tokenizer
+
+
+def build_model(cfg_path: Path, tokenizer: TextTokenizer, base_checkpoint: Path,
+                device: torch.device, args: argparse.Namespace) -> UnifiedVoice:
+    cfg = OmegaConf.load(cfg_path)
+    vocab_size = tokenizer.vocab_size
+    if cfg.gpt.number_text_tokens != vocab_size:
+        raise ValueError("Tokenizer vocabulary differs from base config; LoRA cannot train new token embeddings.")
+
+    model = UnifiedVoice(**cfg.gpt)
+    checkpoint = torch.load(base_checkpoint, map_location="cpu")
+    raw_state_dict = checkpoint.get("model", checkpoint)
+
+    filtered_state_dict = {}
+    for key, value in raw_state_dict.items():
+        if key.startswith("inference_model."):
+            continue
+        if ".lora_" in key:
+            continue
+        new_key = key.replace(".base_layer.", ".")
+        if new_key == "gpt.wte.weight":
+            continue
+        filtered_state_dict[new_key] = value
+    state_dict = filtered_state_dict
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        raise ValueError(f"Base checkpoint is missing frozen model weights: {missing}")
+    if unexpected:
+        print(f"[Warn] Unexpected keys during load: {unexpected}")
+
+    model.requires_grad_(False)
+    # GPT2 has no wte during training; PEFT's checkpointing input hook expects it.
+    # Also avoid reentrant checkpointing discarding gradients on frozen inputs.
+    model.gpt.gradient_checkpointing_disable()
+    targets = [value.strip() for value in args.lora_target_modules.split(",") if value.strip()]
+    if not targets:
+        raise ValueError("At least one LoRA target module is required.")
+    model.gpt = get_peft_model(
+        model.gpt,
+        LoraConfig(task_type=TaskType.FEATURE_EXTRACTION, r=args.lora_r,
+                   lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                   target_modules=targets, bias="none"),
+    )
+    model.to(device)
+    model.gpt.print_trainable_parameters()
+    return model
+
+
+def compute_losses(
+    model: UnifiedVoice,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    use_duration_control: bool = False,
+    duration_dropout: float = 0.3,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    condition = batch["condition"].to(device)
+    text_ids = batch["text_ids"].to(device)
+    codes = batch["codes"].to(device)
+    emo_vec = batch["emo_vec"].to(device)
+    text_lengths = batch["text_lengths"].to(device)
+    code_lengths = batch["code_lengths"].to(device)
+
+    batch_size = text_ids.size(0)
+    use_speed = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    text_inputs = model.set_text_padding(text_ids.clone(), text_lengths)
+    text_inputs = F.pad(text_inputs, (0, 1), value=model.stop_text_token)
+    text_inputs, text_targets = model.build_aligned_inputs_and_targets(
+        text_inputs, model.start_text_token, model.stop_text_token
+    )
+
+    mel_inputs = model.set_mel_padding(codes.clone(), code_lengths)
+    mel_inputs = F.pad(mel_inputs, (0, 1), value=model.stop_mel_token)
+    mel_inputs, mel_targets = model.build_aligned_inputs_and_targets(
+        mel_inputs, model.start_mel_token, model.stop_mel_token
+    )
+
+    duration_free = model.speed_emb(torch.zeros_like(use_speed))
+    if use_duration_control:
+        duration_ctrl = model.get_duration_embeddings(code_lengths)
+        if duration_dropout > 0.0:
+            drop_mask = torch.rand(code_lengths.size(0), device=device) < duration_dropout
+            if drop_mask.any():
+                duration_ctrl = torch.where(drop_mask.unsqueeze(1), duration_free, duration_ctrl)
+    else:
+        duration_ctrl = model.speed_emb(torch.ones_like(use_speed))
+    conds = torch.cat(
+        (condition + emo_vec.unsqueeze(1), duration_ctrl.unsqueeze(1), duration_free.unsqueeze(1)),
+        dim=1,
+    )
+
+    text_emb = model.text_embedding(text_inputs) + model.text_pos_embedding(text_inputs)
+    mel_emb = model.mel_embedding(mel_inputs) + model.mel_pos_embedding(mel_inputs)
+
+    text_logits, mel_logits = model.get_logits(conds, text_emb, model.text_head, mel_emb, model.mel_head)
+
+    text_mask = (
+        torch.arange(text_targets.size(1), device=device).unsqueeze(0)
+        < (text_lengths + 1).unsqueeze(1)
+    )
+    mel_mask = (
+        torch.arange(mel_targets.size(1), device=device).unsqueeze(0)
+        < (code_lengths + 1).unsqueeze(1)
+    )
+
+    text_ce = F.cross_entropy(text_logits, text_targets, reduction="none")
+    mel_ce = F.cross_entropy(mel_logits, mel_targets, reduction="none")
+
+    text_loss = (text_ce * text_mask).sum() / text_mask.sum().clamp_min(1)
+    mel_loss = (mel_ce * mel_mask).sum() / mel_mask.sum().clamp_min(1)
+
+    metrics = {}
+    with torch.no_grad():
+        mel_logits_flat = mel_logits.permute(0, 2, 1).reshape(-1, mel_logits.size(1))
+        mel_targets_flat = mel_targets.reshape(-1)
+        mel_mask_flat = mel_mask.reshape(-1)
+        if mel_mask_flat.any():
+            valid_logits = mel_logits_flat[mel_mask_flat]
+            valid_targets = mel_targets_flat[mel_mask_flat]
+            top1 = (valid_logits.argmax(dim=-1) == valid_targets).float().mean().item()
+        else:
+            top1 = 0.0
+        metrics["mel_top1"] = top1
+
+    return text_loss, mel_loss, metrics
+
+
+def canonicalize_tensor_tree(value: object) -> object:
+    """Clone tensor leaves to stable CPU storage for evidence serialization."""
+    if torch.is_tensor(value):
+        return value.detach().cpu().contiguous().clone()
+    if isinstance(value, dict):
+        return {key: canonicalize_tensor_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [canonicalize_tensor_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(canonicalize_tensor_tree(item) for item in value)
+    return value
+
+
+def save_resume_artifacts(
+    path: Path,
+    state: Dict[str, object],
+    *,
+    completed_epochs: int,
+) -> Path:
+    target = resume_artifacts_path(path)
+    if target.exists() or target.is_symlink():
+        raise ValueError(f"refusing to overwrite resume artifacts: {target}")
+    partial = target.with_name(f".{target.name}.{os.getpid()}.partial")
+    if partial.exists() or partial.is_symlink():
+        raise ValueError(f"resume artifact partial already exists: {partial}")
+    partial.mkdir(mode=0o700)
+    published = False
+    try:
+        if state.get("scheduler") is None:
+            raise ValueError("resume artifacts require scheduler state")
+        state_completed_epochs = int(state["epoch"]) + 1
+        if state_completed_epochs != completed_epochs:
+            raise ValueError(
+                "resume artifact epoch does not match checkpoint metadata progress"
+            )
+        serialized = {
+            "model-state.pt": state["adapter"],
+            "optimizer-state.pt": canonicalize_tensor_tree(state["optimizer"]),
+            "scheduler-state.pt": state["scheduler"],
+            "rng-state.pt": state["rng_state"],
+        }
+        for name, value in serialized.items():
+            output = partial / name
+            torch.save(value, output)
+            with output.open("rb") as handle:
+                os.fsync(handle.fileno())
+        trainer_state = {
+            "schema_version": "1.0.0",
+            "completed_epochs": completed_epochs,
+            "global_step": int(state["step"]),
+        }
+        trainer_path = partial / "trainer-state.json"
+        with trainer_path.open("x", encoding="utf-8") as handle:
+            json.dump(trainer_state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        fsync_directory(partial)
+        os.rename(partial, target)
+        published = True
+        fsync_directory(target.parent)
+    finally:
+        if not published and partial.exists() and not partial.is_symlink():
+            shutil.rmtree(partial)
+    return target
+
+
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler,
+    epoch: int,
+    step: int,
+    recent_checkpoints: List[str],
+    extra: Dict[str, str] | None = None,
+    resume_contract: Dict[str, object] | None = None,
+    completed_epochs: int | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "adapter": get_peft_model_state_dict(model.gpt),
+        "lora": lora_metadata(model),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler else None,
+        "scaler": scaler.state_dict() if scaler else None,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+        "epoch": epoch,
+        "step": step,
+        "recent_checkpoints": recent_checkpoints,
+    }
+    if extra:
+        state["extra"] = extra
+    torch.save(state, path)
+    if resume_contract is not None:
+        if completed_epochs is None:
+            raise ValueError("completed_epochs is required for resumable checkpoints")
+        artifacts = save_resume_artifacts(
+            path,
+            state,
+            completed_epochs=completed_epochs,
+        )
+        write_epoch_resume_metadata(
+            path,
+            resume_contract,
+            completed_epochs=completed_epochs,
+            global_step=step,
+            resume_artifacts=artifacts,
+        )
+
+
+def save_latest_checkpoint(
+    output_dir: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler,
+    epoch: int,
+    step: int,
+    recent_checkpoints: List[str],
+    manifest_metadata: Dict[str, object],
+) -> None:
+    """Atomically publish the optional legacy latest.pth compatibility copy."""
+    target = output_dir / "latest.pth"
+    partial = output_dir / f".latest.pth.{os.getpid()}.partial"
+    if partial.exists() or partial.is_symlink():
+        raise ValueError(f"latest checkpoint partial already exists: {partial}")
+    state = {
+        "adapter": get_peft_model_state_dict(model.gpt),
+        "lora": lora_metadata(model),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler else None,
+        "scaler": scaler.state_dict() if scaler else None,
+        "epoch": epoch,
+        "step": step,
+        "recent_checkpoints": recent_checkpoints,
+        "manifests": manifest_metadata,
+    }
+    try:
+        torch.save(state, partial)
+        with partial.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(partial, target)
+        fsync_directory(output_dir)
+    finally:
+        if partial.exists() and not partial.is_symlink():
+            partial.unlink()
+
+
+def lora_metadata(model: nn.Module) -> Dict[str, object]:
+    config = next(iter(model.gpt.peft_config.values()))
+    targets = config.target_modules
+    return {
+        "r": int(config.r),
+        "alpha": int(config.lora_alpha),
+        "dropout": float(config.lora_dropout),
+        "target_modules": sorted(targets) if not isinstance(targets, str) else [targets],
+    }
+
+
+def dataset_fingerprint(dataset: GPTPairDataset, *, label: str) -> Dict[str, object]:
+    entries: list[tuple[str, Path]] = []
+    for sample in dataset.samples:
+        if sample is None:
+            raise ValueError(f"{label} contains an unavailable sample before training")
+        entries.extend(
+            (
+                (f"{sample.id}:text_ids", sample.text_ids_path),
+                (f"{sample.id}:codes", sample.codes_path),
+                (f"{sample.id}:condition", sample.condition_path),
+                (f"{sample.id}:emotion", sample.emo_vec_path),
+            )
+        )
+    return aggregate_file_fingerprint(entries, label=label)
+
+
+def evaluate(
+    model: UnifiedVoice,
+    loader: DataLoader,
+    device: torch.device,
+    use_duration_control: bool = False,
+    duration_dropout: float = 0.3,
+) -> Dict[str, float]:
+    model.eval()
+    totals = {"text_loss": 0.0, "mel_loss": 0.0, "mel_top1": 0.0}
+    count = 0
+    with torch.no_grad():
+        for batch in loader:
+            text_loss, mel_loss, metrics = compute_losses(
+                model,
+                batch,
+                device,
+                use_duration_control=use_duration_control,
+                duration_dropout=duration_dropout,
+            )
+            bsz = batch["text_ids"].size(0)
+            totals["text_loss"] += text_loss.item() * bsz
+            totals["mel_loss"] += mel_loss.item() * bsz
+            totals["mel_top1"] += metrics["mel_top1"] * bsz
+            count += bsz
+    model.train()
+    if count == 0:
+        return {k: 0.0 for k in totals}
+    return {k: v / count for k, v in totals.items()}
+
+
+def main() -> None:
+    args = parse_args()
+    if args.batch_size < 1 or args.grad_accumulation < 1 or args.epochs < 1:
+        raise ValueError("batch-size, grad-accumulation and epochs must be positive.")
+    if args.log_interval < 1 or args.learning_rate <= 0:
+        raise ValueError("log-interval and learning-rate must be positive.")
+    if args.lora_r < 1 or args.lora_alpha < 1 or not 0 <= args.lora_dropout < 1:
+        raise ValueError("Invalid LoRA rank, alpha or dropout.")
+    configure_determinism(args.deterministic)
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_root = output_dir / "logs"
+    log_root.mkdir(parents=True, exist_ok=True)
+    run_name = (
+        f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        if os.environ.get("INDEXTTS_RUN_NAME") is None
+        else os.environ["INDEXTTS_RUN_NAME"]
+    )
+    log_dir = log_root / run_name
+    writer = SummaryWriter(log_dir=str(log_dir))
+
+    tokenizer = load_tokenizer(args.tokenizer)
+    model = build_model(args.config, tokenizer, args.base_checkpoint, device, args)
+
+    train_specs = parse_manifest_specs(args.train_manifests, "--train-manifest")
+    val_specs = parse_manifest_specs(args.val_manifests, "--val-manifest")
+
+    print("[Info] Loading training manifests...")
+    train_dataset = GPTPairDataset(train_specs)
+    print("[Info] Loading validation manifests...")
+    val_dataset = GPTPairDataset(val_specs)
+
+    manifest_metadata = {
+        "train": [
+            {
+                "path": str(entry["path"]),
+                "count": entry["count"],
+                "languages": list(entry["languages"]),
+            }
+            for entry in train_dataset.manifest_summaries
+        ],
+        "val": [
+            {
+                "path": str(entry["path"]),
+                "count": entry["count"],
+                "languages": list(entry["languages"]),
+            }
+            for entry in val_dataset.manifest_summaries
+        ],
+    }
+
+    def checkpoint_extra(extra_type: str) -> Dict[str, object]:
+        return {
+            "type": extra_type,
+            "manifests": manifest_metadata,
+            "lora": {
+                "r": args.lora_r,
+                "alpha": args.lora_alpha,
+                "dropout": args.lora_dropout,
+                "target_modules": [value.strip() for value in args.lora_target_modules.split(",") if value.strip()],
+            },
+        }
+
+    use_cuda = torch.cuda.is_available()
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=collate_batch,
+        pin_memory=use_cuda,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_batch,
+        pin_memory=use_cuda,
+    )
+
+    optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / max(1, args.grad_accumulation)))
+    if args.val_interval <= 0:
+        args.val_interval = optimizer_steps_per_epoch
+        print(f"[Info] Validation interval set to one epoch: {args.val_interval} optimizer steps.")
+    else:
+        print(f"[Info] Validation interval: every {args.val_interval} optimizer steps.")
+
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_parameters:
+        raise RuntimeError("LoRA did not expose trainable parameters; check target modules.")
+    optimizer = AdamW(trainable_parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
+    total_steps = args.max_steps if args.max_steps > 0 else args.epochs * optimizer_steps_per_epoch
+    total_steps = max(total_steps, 1)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=total_steps,
+    )
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
+    model_source = inspect.getsourcefile(UnifiedVoice)
+    if model_source is None:
+        raise RuntimeError("cannot resolve the UnifiedVoice implementation source")
+    resume_contract: Dict[str, object] = {
+        "schema_version": "1.0.0",
+        "adaptation_mode": "lora",
+        "output_dir": str(output_dir),
+        "inputs": {
+            "tokenizer": regular_file_record(args.tokenizer, label="tokenizer"),
+            "config": regular_file_record(args.config, label="config"),
+            "base_checkpoint": regular_file_record(
+                args.base_checkpoint, label="base checkpoint"
+            ),
+            "trainer_source": regular_file_record(
+                Path(__file__), label="trainer source"
+            ),
+            "resume_contract_source": regular_file_record(
+                Path(__file__).with_name("index_resume_contract.py"),
+                label="resume contract source",
+            ),
+            "model_source": regular_file_record(
+                Path(model_source), label="UnifiedVoice source"
+            ),
+            "train_manifests": aggregate_file_fingerprint(
+                [
+                    (f"{index}:{spec.language or 'unspecified'}", spec.path)
+                    for index, spec in enumerate(train_specs)
+                ],
+                label="training manifests",
+            ),
+            "validation_manifests": aggregate_file_fingerprint(
+                [
+                    (f"{index}:{spec.language or 'unspecified'}", spec.path)
+                    for index, spec in enumerate(val_specs)
+                ],
+                label="validation manifests",
+            ),
+            "train_features": dataset_fingerprint(
+                train_dataset, label="training features"
+            ),
+            "validation_features": dataset_fingerprint(
+                val_dataset, label="validation features"
+            ),
+        },
+        "training": {
+            "batch_size": args.batch_size,
+            "grad_accumulation": args.grad_accumulation,
+            "epochs": args.epochs,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+            "warmup_steps": args.warmup_steps,
+            "max_steps": args.max_steps,
+            "total_steps": total_steps,
+            "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+            "val_interval": args.val_interval,
+            "grad_clip": args.grad_clip,
+            "text_loss_weight": args.text_loss_weight,
+            "mel_loss_weight": args.mel_loss_weight,
+            "use_duration_control": args.use_duration_control,
+            "duration_dropout": args.duration_dropout,
+            "seed": args.seed,
+            "num_workers": args.num_workers,
+            "deterministic": args.deterministic,
+            "write_latest": args.write_latest,
+            "lora_r": args.lora_r,
+            "lora_alpha": args.lora_alpha,
+            "lora_dropout": args.lora_dropout,
+            "lora_target_modules": args.lora_target_modules,
+        },
+        "runtime": {
+            "python": sys.version,
+            "numpy": str(np.__version__),
+            "torch": str(torch.__version__),
+            "torch_cuda": str(torch.version.cuda),
+            "transformers": importlib.metadata.version("transformers"),
+            "omegaconf": importlib.metadata.version("omegaconf"),
+            "peft": importlib.metadata.version("peft"),
+            "device_type": device.type,
+            "cuda_device_count": torch.cuda.device_count() if use_cuda else 0,
+            "cuda_device_name": torch.cuda.get_device_name(device) if use_cuda else None,
+            "amp": use_amp,
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        },
+    }
+
+    global_step = 0
+    start_epoch = 0
+    recent_checkpoints: List[str] = []
+    last_saved_step: int | None = None
+
+    resume_path = resolve_resume_checkpoint(args.resume, output_dir)
+    if resume_path:
+        resume_metadata = verify_resume_checkpoint(
+            resume_path,
+            resume_contract,
+            trust_resume_state=args.trust_resume_state,
+            target_epochs=args.epochs,
+        )
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        for required_key in (
+            "adapter",
+            "optimizer",
+            "scheduler",
+            "rng_state",
+            "epoch",
+            "step",
+        ):
+            if required_key not in checkpoint:
+                raise ValueError(f"resume checkpoint is missing {required_key}")
+        checkpoint_epoch = checkpoint["epoch"]
+        checkpoint_step = checkpoint["step"]
+        if (
+            not isinstance(checkpoint_epoch, int)
+            or isinstance(checkpoint_epoch, bool)
+            or checkpoint_epoch < 0
+        ):
+            raise ValueError("resume checkpoint epoch must be a nonnegative integer")
+        if (
+            not isinstance(checkpoint_step, int)
+            or isinstance(checkpoint_step, bool)
+            or checkpoint_step < 1
+        ):
+            raise ValueError("resume checkpoint step must be a positive integer")
+        if checkpoint_epoch + 1 != resume_metadata["completed_epochs"]:
+            raise ValueError("resume checkpoint epoch does not match its metadata")
+        if checkpoint_step != resume_metadata["global_step"]:
+            raise ValueError("resume checkpoint step does not match its metadata")
+        if use_amp and not checkpoint.get("scaler"):
+            raise ValueError("AMP resume checkpoint is missing scaler state")
+        validate_adapter_state(get_peft_model_state_dict(model.gpt), checkpoint["adapter"])
+        set_peft_model_state_dict(model.gpt, checkpoint["adapter"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        if scaler and checkpoint.get("scaler"):
+            scaler.load_state_dict(checkpoint["scaler"])
+        rng_state = checkpoint["rng_state"]
+        if not isinstance(rng_state, dict) or not all(
+            name in rng_state for name in ("python", "numpy", "torch", "cuda")
+        ):
+            raise ValueError("resume checkpoint RNG state is incomplete")
+        random.setstate(rng_state["python"])
+        np.random.set_state(rng_state["numpy"])
+        torch.set_rng_state(rng_state["torch"].cpu())
+        if use_cuda:
+            cuda_rng_state = rng_state["cuda"]
+            if not isinstance(cuda_rng_state, list) or not cuda_rng_state:
+                raise ValueError("CUDA resume checkpoint RNG state is incomplete")
+            torch.cuda.set_rng_state_all(
+                [state.cpu() for state in cuda_rng_state]
+            )
+        start_epoch = resume_metadata["completed_epochs"]
+        global_step = resume_metadata["global_step"]
+        recent_checkpoints = validate_recent_checkpoints(
+            checkpoint.get("recent_checkpoints", []), output_dir
+        )
+        last_saved_step = global_step
+        print(f"[Info] Resumed from {resume_path} at epoch {start_epoch}, step {global_step}.")
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    save_every = 1000
+    best_val = math.inf
+
+    if args.val_interval > 0 and global_step > 0:
+        # If we resumed exactly on a validation boundary we postpone evaluation until
+        # after the next training step to avoid running validation before training.
+        print("[Info] Skipping startup validation; will evaluate after next training interval.")
+
+    for epoch in range(start_epoch, args.epochs):
+        for batch_idx, batch in enumerate(train_loader):
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                text_loss, mel_loss, metrics = compute_losses(
+                    model,
+                    batch,
+                    device,
+                    use_duration_control=args.use_duration_control,
+                    duration_dropout=args.duration_dropout,
+                )
+                loss = args.text_loss_weight * text_loss + args.mel_loss_weight * mel_loss
+            group_start = (batch_idx // args.grad_accumulation) * args.grad_accumulation
+            group_size = min(args.grad_accumulation, len(train_loader) - group_start)
+            if use_amp:
+                scaler.scale(loss / group_size).backward()
+            else:
+                (loss / group_size).backward()
+
+            should_step = ((batch_idx + 1) % args.grad_accumulation == 0
+                           or (batch_idx + 1) == len(train_loader))
+            if should_step:
+                if args.grad_clip > 0:
+                    if use_amp:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                skipped_update = False
+                if use_amp:
+                    previous_scale = scaler.get_scale()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    skipped_update = scaler.get_scale() < previous_scale
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if skipped_update:
+                    continue
+                scheduler.step()
+
+                global_step += 1
+
+                if global_step % args.log_interval == 0:
+                    writer.add_scalar("train/text_loss", text_loss.item(), global_step)
+                    writer.add_scalar("train/mel_loss", mel_loss.item(), global_step)
+                    writer.add_scalar("train/mel_top1", metrics["mel_top1"], global_step)
+                    writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
+                    print(
+                        f"[Train] epoch={epoch + 1} step={global_step} "
+                        f"text_loss={text_loss.item():.4f} mel_loss={mel_loss.item():.4f} "
+                        f"mel_top1={metrics['mel_top1']:.4f} lr={scheduler.get_last_lr()[0]:.2e}"
+                    )
+
+                if args.val_interval > 0 and global_step > 0 and global_step % args.val_interval == 0:
+                    val_metrics = evaluate(
+                        model,
+                        val_loader,
+                        device,
+                        use_duration_control=args.use_duration_control,
+                        duration_dropout=args.duration_dropout,
+                    )
+                    writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
+                    writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
+                    writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
+                    print(
+                        f"[Val] epoch={epoch + 1} step={global_step} "
+                        f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
+                        f"mel_top1={val_metrics['mel_top1']:.4f}"
+                    )
+                    if val_metrics["mel_loss"] < best_val:
+                        best_val = val_metrics["mel_loss"]
+
+                if global_step % save_every == 0:
+                    ckpt_path = output_dir / f"model_step{global_step}.pth"
+                    recent_checkpoints.append(str(ckpt_path))
+                    save_checkpoint(
+                        ckpt_path,
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        epoch,
+                        global_step,
+                        recent_checkpoints,
+                        extra=checkpoint_extra("step"),
+                    )
+                    if args.write_latest:
+                        save_latest_checkpoint(
+                            output_dir,
+                            model,
+                            optimizer,
+                            scheduler,
+                            scaler,
+                            epoch,
+                            global_step,
+                            recent_checkpoints,
+                            manifest_metadata,
+                        )
+                    last_saved_step = global_step
+
+                if args.max_steps and global_step >= args.max_steps:
+                    break
+
+            if args.max_steps and global_step >= args.max_steps:
+                break
+
+        if args.max_steps and global_step >= args.max_steps:
+            break
+
+        if global_step > 0:
+            epoch_ckpt_path = output_dir / f"model_epoch{epoch + 1:02d}_step{global_step}.pth"
+            recent_checkpoints.append(str(epoch_ckpt_path))
+            save_checkpoint(
+                epoch_ckpt_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch,
+                global_step,
+                recent_checkpoints,
+                extra=checkpoint_extra("epoch"),
+                resume_contract=resume_contract,
+                completed_epochs=epoch + 1,
+            )
+            if args.write_latest:
+                save_latest_checkpoint(
+                    output_dir,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    global_step,
+                    recent_checkpoints,
+                    manifest_metadata,
+                )
+            print(f"[Checkpoint] saved {epoch_ckpt_path.name}")
+            last_saved_step = global_step
+
+
+    if global_step > 0 and last_saved_step != global_step:
+        ckpt_path = output_dir / f"model_step{global_step}.pth"
+        recent_checkpoints.append(str(ckpt_path))
+        save_checkpoint(
+            ckpt_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch,
+            global_step,
+            recent_checkpoints,
+            extra=checkpoint_extra("step-final"),
+        )
+        if args.write_latest:
+            save_latest_checkpoint(
+                output_dir,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch,
+                global_step,
+                recent_checkpoints,
+                manifest_metadata,
+            )
+
+    writer.close()
+    print("Training complete.")
+
+
+if __name__ == "__main__":
+    main()

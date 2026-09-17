@@ -1,224 +1,126 @@
-import json
-import os
-import sys
-import time
-import pandas as pd
-from omegaconf import OmegaConf
-
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
-sys.path.append(os.path.join(current_dir, "indextts"))
+"""Gradio inference UI for the base IndexTTS2 model or one LoRA checkpoint."""
+from __future__ import annotations
 
 import argparse
-parser = argparse.ArgumentParser(description="IndexTTS WebUI")
-parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
-parser.add_argument("--port", type=int, default=7860, help="Port to run the web UI on")
-parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to run the web UI on")
-parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
-parser.add_argument("--config", type=str, default=None,
-                    help="Config path; use finetune_models/config_finetuned.yaml for a merged LoRA model")
-parser.add_argument("--speaker_info", type=str, default=None,
-                    help="Optional speaker_info.json generated during fine-tuning")
-cmd_args = parser.parse_args()
+import sys
+import time
+from pathlib import Path
 
-if not os.path.exists(cmd_args.model_dir):
-    print(f"Model directory {cmd_args.model_dir} does not exist. Please download the model first.")
-    sys.exit(1)
-
-config_path = cmd_args.config or os.path.join(cmd_args.model_dir, "config.yaml")
-if not os.path.isfile(config_path):
-    print(f"Required config {config_path} does not exist.")
-    sys.exit(1)
-model_config = OmegaConf.load(config_path)
-for file in [model_config.bigvgan_checkpoint, model_config.dataset.bpe_model, model_config.gpt_checkpoint]:
-    file_path = os.path.join(cmd_args.model_dir, file)
-    if not os.path.exists(file_path):
-        print(f"Required file {file_path} does not exist. Please download it.")
-        sys.exit(1)
+PROJECT_ROOT = Path(__file__).resolve().parent
+UPSTREAM_ROOT = PROJECT_ROOT / "vendor" / "index-tts"
+if not UPSTREAM_ROOT.is_dir():
+    raise RuntimeError("Missing vendor/index-tts. Run scripts/windows/setup.ps1 first.")
+sys.path.insert(0, str(UPSTREAM_ROOT))
 
 import gradio as gr
-
-from indextts.infer import IndexTTS
-from tools.i18n.i18n import I18nAuto
-
-i18n = I18nAuto(language="zh_CN")
-tts = IndexTTS(model_dir=cmd_args.model_dir, cfg_path=config_path,
-               speaker_info_path=cmd_args.speaker_info)
+import torch
+from indextts.infer_v2 import IndexTTS2
+from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
+from trainers.lora_state import validate_adapter_state
 
 
-os.makedirs("outputs/tasks",exist_ok=True)
-os.makedirs("prompts",exist_ok=True)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="IndexTTS2 LoRA WebUI")
+    parser.add_argument("--model-dir", default="checkpoints")
+    parser.add_argument("--config", default="checkpoints/config.yaml")
+    parser.add_argument("--lora-checkpoint", default=None)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--share", action="store_true")
+    return parser.parse_args()
 
-with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
-    example_cases = []
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        example = json.loads(line)
-        example_cases.append([os.path.join("tests", example.get("prompt_audio", "sample_prompt.wav")),
-                              example.get("text"), ["普通推理", "批次推理"][example.get("infer_mode", 0)]])
 
-def gen_single(prompt, text, infer_mode, speaker_id, max_text_tokens_per_sentence=120, sentences_bucket_max_size=4,
-                *args, progress=gr.Progress()):
-    if not prompt or not os.path.isfile(prompt):
-        raise gr.Error("请上传有效的参考音频。")
+def apply_lora(engine: IndexTTS2, checkpoint_path: str) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if "adapter" not in checkpoint:
+        raise ValueError("Checkpoint does not contain IndexTTS2 LoRA adapter weights.")
+    metadata = checkpoint.get("lora", checkpoint.get("extra", {}).get("lora", {}))
+    if not all(key in metadata for key in ("r", "alpha", "target_modules")):
+        raise ValueError("Checkpoint lacks required LoRA configuration metadata.")
+    targets = metadata.get("target_modules", ["c_attn", "c_proj", "c_fc"])
+    adapted = get_peft_model(
+        engine.gpt.gpt,
+        LoraConfig(task_type=TaskType.FEATURE_EXTRACTION,
+                   r=int(metadata.get("r", 16)),
+                   lora_alpha=int(metadata.get("alpha", 32)),
+                   lora_dropout=0.0, target_modules=targets, bias="none"),
+    )
+    validate_adapter_state(get_peft_model_state_dict(adapted), checkpoint["adapter"])
+    result = set_peft_model_state_dict(adapted, checkpoint["adapter"])
+    if getattr(result, "unexpected_keys", None):
+        raise ValueError(f"Unexpected LoRA keys: {result.unexpected_keys}")
+    merged = adapted.merge_and_unload().eval()
+    engine.gpt.gpt = merged
+    engine.gpt.inference_model.transformer = merged
+
+
+engine = None
+
+
+def synthesize(speaker_audio, text, emotion_audio, emotion_alpha, use_emotion_text,
+               emotion_text, max_text_tokens, top_p, top_k, temperature, num_beams,
+               interval_silence):
+    if not speaker_audio or not Path(speaker_audio).is_file():
+        raise gr.Error("请上传有效的说话人参考音频。")
     if not text or not text.strip():
         raise gr.Error("请输入待合成文本。")
-    output_path = os.path.join("outputs", f"spk_{time.time_ns()}.wav")
-    # set gradio progress
-    tts.gr_progress = progress
-    do_sample, top_p, top_k, temperature, \
-        length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
-    kwargs = {
-        "do_sample": bool(do_sample),
-        "top_p": float(top_p),
-        "top_k": int(top_k) if int(top_k) > 0 else None,
-        "temperature": float(temperature),
-        "length_penalty": float(length_penalty),
-        "num_beams": num_beams,
-        "repetition_penalty": float(repetition_penalty),
-        "max_mel_tokens": int(max_mel_tokens),
-        # "typical_sampling": bool(typical_sampling),
-        # "typical_mass": float(typical_mass),
-    }
-    speaker_id = speaker_id or None
-    if infer_mode == "普通推理":
-        output = tts.infer(prompt, text, output_path, verbose=cmd_args.verbose,
-                           max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-                           speaker_id=speaker_id,
-                           **kwargs)
-    else:
-        # 批次推理
-        output = tts.infer_fast(prompt, text, output_path, verbose=cmd_args.verbose,
-            max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-            sentences_bucket_max_size=(sentences_bucket_max_size),
-            speaker_id=speaker_id,
-            **kwargs)
-    return gr.update(value=output,visible=True)
-
-def update_prompt_audio():
-    update_button = gr.update(interactive=True)
-    return update_button
-
-with gr.Blocks(title="IndexTTS Demo") as demo:
-    gr.HTML('''
-    <h2><center>IndexTTS: An Industrial-Level Controllable and Efficient Zero-Shot Text-To-Speech System</h2>
-    <h2><center>(一款工业级可控且高效的零样本文本转语音系统)</h2>
-<p align="center">
-<a href='https://arxiv.org/abs/2502.05512'><img src='https://img.shields.io/badge/ArXiv-2502.05512-red'></a>
-</p>
-    ''')
-    with gr.Tab("音频生成"):
-        with gr.Row():
-            os.makedirs("prompts",exist_ok=True)
-            prompt_audio = gr.Audio(label="参考音频",key="prompt_audio",
-                                    sources=["upload","microphone"],type="filepath")
-            with gr.Column():
-                input_text_single = gr.TextArea(label="文本",key="input_text_single", placeholder="请输入目标文本", info="当前模型版本{}".format(tts.model_version or "1.0"))
-                infer_mode = gr.Radio(choices=["普通推理", "批次推理"], label="推理模式",info="批次推理：更适合长句，性能翻倍",value="普通推理")        
-                speaker_id = gr.Dropdown(
-                    choices=tts.speaker_list,
-                    value=tts.speaker_list[0] if tts.speaker_list else None,
-                    label="微调说话人",
-                    info="来自微调 checkpoint；基础模型无需选择",
-                    visible=bool(tts.speaker_list),
-                )
-                gen_button = gr.Button("生成语音", key="gen_button",interactive=True)
-            output_audio = gr.Audio(label="生成结果", visible=True,key="output_audio")
-        with gr.Accordion("高级生成参数设置", open=False):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown("**GPT2 采样设置** _参数会影响音频多样性和生成速度详见[Generation strategies](https://huggingface.co/docs/transformers/main/en/generation_strategies)_")
-                    with gr.Row():
-                        do_sample = gr.Checkbox(label="do_sample", value=True, info="是否进行采样")
-                        temperature = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=1.0, step=0.1)
-                    with gr.Row():
-                        top_p = gr.Slider(label="top_p", minimum=0.0, maximum=1.0, value=0.8, step=0.01)
-                        top_k = gr.Slider(label="top_k", minimum=0, maximum=100, value=30, step=1)
-                        num_beams = gr.Slider(label="num_beams", value=3, minimum=1, maximum=10, step=1)
-                    with gr.Row():
-                        repetition_penalty = gr.Number(label="repetition_penalty", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
-                        length_penalty = gr.Number(label="length_penalty", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
-                    max_mel_tokens = gr.Slider(label="max_mel_tokens", value=600, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens, step=10, info="生成Token最大数量，过小导致音频被截断", key="max_mel_tokens")
-                    # with gr.Row():
-                    #     typical_sampling = gr.Checkbox(label="typical_sampling", value=False, info="不建议使用")
-                    #     typical_mass = gr.Slider(label="typical_mass", value=0.9, minimum=0.0, maximum=1.0, step=0.1)
-                with gr.Column(scale=2):
-                    gr.Markdown("**分句设置** _参数会影响音频质量和生成速度_")
-                    with gr.Row():
-                        max_text_tokens_per_sentence = gr.Slider(
-                            label="分句最大Token数", value=120, minimum=20, maximum=tts.cfg.gpt.max_text_tokens, step=2, key="max_text_tokens_per_sentence",
-                            info="建议80~200之间，值越大，分句越长；值越小，分句越碎；过小过大都可能导致音频质量不高",
-                        )
-                        sentences_bucket_max_size = gr.Slider(
-                            label="分句分桶的最大容量（批次推理生效）", value=4, minimum=1, maximum=16, step=1, key="sentences_bucket_max_size",
-                            info="建议2-8之间，值越大，一批次推理包含的分句数越多，过大可能导致内存溢出",
-                        )
-                    with gr.Accordion("预览分句结果", open=True) as sentences_settings:
-                        sentences_preview = gr.Dataframe(
-                            headers=["序号", "分句内容", "Token数"],
-                            key="sentences_preview",
-                            wrap=True,
-                        )
-            advanced_params = [
-                do_sample, top_p, top_k, temperature,
-                length_penalty, num_beams, repetition_penalty, max_mel_tokens,
-                # typical_sampling, typical_mass,
-            ]
-        
-        if len(example_cases) > 0:
-            gr.Examples(
-                examples=example_cases,
-                inputs=[prompt_audio, input_text_single, infer_mode],
-            )
-
-    def on_input_text_change(text, max_tokens_per_sentence):
-        if text and len(text) > 0:
-            text_tokens_list = tts.tokenizer.tokenize(text)
-
-            sentences = tts.tokenizer.split_sentences(text_tokens_list, max_tokens_per_sentence=int(max_tokens_per_sentence))
-            data = []
-            for i, s in enumerate(sentences):
-                sentence_str = ''.join(s)
-                tokens_count = len(s)
-                data.append([i, sentence_str, tokens_count])
-            
-            return {
-                sentences_preview: gr.update(value=data, visible=True, type="array"),
-            }
-        else:
-            df = pd.DataFrame([], columns=["序号", "分句内容", "Token数"])
-            return {
-                sentences_preview: gr.update(value=df)
-            }
-
-    input_text_single.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_sentence],
-        outputs=[sentences_preview]
+    output = PROJECT_ROOT / "outputs" / f"indextts2_{time.time_ns()}.wav"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    engine.infer(
+        spk_audio_prompt=speaker_audio,
+        text=text.strip(),
+        output_path=str(output),
+        emo_audio_prompt=emotion_audio or None,
+        emo_alpha=float(emotion_alpha),
+        use_emo_text=bool(use_emotion_text),
+        emo_text=(emotion_text or "").strip() or None,
+        max_text_tokens_per_segment=int(max_text_tokens),
+        top_p=float(top_p), top_k=int(top_k), temperature=float(temperature),
+        num_beams=int(num_beams), interval_silence=int(interval_silence),
+        verbose=True,
     )
-    max_text_tokens_per_sentence.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_sentence],
-        outputs=[sentences_preview]
-    )
-    prompt_audio.upload(update_prompt_audio,
-                         inputs=[],
-                         outputs=[gen_button])
+    return str(output)
 
-    gen_button.click(gen_single,
-                     inputs=[prompt_audio, input_text_single, infer_mode, speaker_id,
-                             max_text_tokens_per_sentence, sentences_bucket_max_size,
-                             *advanced_params,
-                     ],
-                     outputs=[output_audio])
 
+title = "IndexTTS2 LoRA / Base"
+with gr.Blocks(title=title) as demo:
+    gr.Markdown(f"# {title}\n启动时选择基础模型或 LoRA；当前权重路径显示在终端。")
+    with gr.Row():
+        speaker = gr.Audio(label="说话人参考音频", sources=["upload", "microphone"], type="filepath")
+        emotion = gr.Audio(label="情绪参考音频（可选）", sources=["upload"], type="filepath")
+    text = gr.TextArea(label="合成文本", lines=5)
+    with gr.Accordion("情绪与生成参数", open=False):
+        emotion_alpha = gr.Slider(0, 1, value=1, step=0.05, label="情绪强度")
+        use_emotion_text = gr.Checkbox(False, label="从情绪文本提取情绪")
+        emotion_text = gr.Textbox(label="情绪文本（可选）")
+        max_text_tokens = gr.Slider(20, 600, value=120, step=1, label="每段最大文本 Token")
+        top_p = gr.Slider(0.1, 1, value=0.8, step=0.01, label="Top P")
+        top_k = gr.Slider(1, 100, value=30, step=1, label="Top K")
+        temperature = gr.Slider(0.1, 2, value=1, step=0.05, label="Temperature")
+        num_beams = gr.Slider(1, 10, value=3, step=1, label="Beams")
+        interval_silence = gr.Slider(0, 2000, value=200, step=10, label="分段静音（毫秒）")
+    generate = gr.Button("生成", variant="primary")
+    result = gr.Audio(label="生成结果", type="filepath")
+    generate.click(synthesize,
+                   inputs=[speaker, text, emotion, emotion_alpha, use_emotion_text,
+                           emotion_text, max_text_tokens, top_p, top_k, temperature,
+                           num_beams, interval_silence], outputs=result)
 
 if __name__ == "__main__":
-    demo.queue(20)
-    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port)
+    args = parse_args()
+    for required in (Path(args.config), Path(args.model_dir) / "gpt.pth"):
+        if not required.is_file():
+            raise FileNotFoundError(f"Required IndexTTS2 file not found: {required}")
+    if args.lora_checkpoint and not Path(args.lora_checkpoint).is_file():
+        raise FileNotFoundError(f"LoRA checkpoint not found: {args.lora_checkpoint}")
+    engine = IndexTTS2(cfg_path=args.config, model_dir=args.model_dir,
+                      device=args.device,
+                      use_fp16=torch.cuda.is_available() and (args.device is None or args.device.startswith("cuda")),
+                      use_cuda_kernel=False)
+    if args.lora_checkpoint:
+        apply_lora(engine, args.lora_checkpoint)
+    print(f"Active weights: {args.lora_checkpoint or 'official base model'}")
+    demo.queue(default_concurrency_limit=1).launch(server_name=args.host,
+                                                   server_port=args.port,
+                                                   share=args.share)
