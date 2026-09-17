@@ -75,7 +75,7 @@ processed_data/ljspeech/gpt_pairs_val.jsonl
 .\scripts\windows\train.ps1
 ```
 
-默认参数适合先验证流程：batch size 2、梯度累积 8、10 epochs、AMP、LoRA rank 16。可覆盖：
+默认参数按 RTX 4080 调整：batch size 1、梯度累积 16、10 epochs、AMP、LoRA rank 16。脚本会先显示实际 GPU、显存和 CUDA runtime；如果 CUDA 不可用会立即停止。桌面 RTX 4080 通常为 16GB，笔记本 RTX 4080 通常为 12GB，此保守默认值兼顾两者。可覆盖：
 
 ```powershell
 .\scripts\windows\train.ps1 -BatchSize 1 -GradAccumulation 16 -Epochs 5
@@ -91,8 +91,8 @@ python train.py `
   --config checkpoints\config.yaml `
   --base-checkpoint checkpoints\gpt.pth `
   --output-dir trained_ckpts `
-  --batch-size 2 `
-  --grad-accumulation 8 `
+  --batch-size 1 `
+  --grad-accumulation 16 `
   --epochs 10 `
   --learning-rate 1e-4 `
   --lora-r 16 `
@@ -159,7 +159,13 @@ JSONL 的 `speaker` 是配对用的说话人分组 ID，不是声音嵌入，也
 
 重新预处理时已有 ID 保持原来的 train/val 归属。修改文本、模型、分词器、说话人或拆分比例后，应使用全新的 `--output-dir`，避免旧特征、旧 manifest 混入。`--skip-existing` 仅用于同一份输入及同一套模型下的断点续提，不验证文件内容哈希。
 
-训练 batch size 与预处理 batch size 独立。默认有效 batch 约为 `2 × 8 = 16` 个配对，末尾不足一组仍更新；显存不足先把训练 batch 降为 1，再增加梯度累积。LoRA 只减少可训练参数及优化器状态，不保证低显存：基础模型、激活、预处理辅助模型仍占显存。目前关闭 GPT 梯度检查点，避免冻结输入及移除 `wte` 后与 PEFT 的输入梯度钩子冲突。
+训练 batch size 与预处理 batch size 独立。RTX 4080 默认有效 batch 约为 `1 × 16 = 16` 个配对，末尾不足一组仍更新。桌面版 16GB 若显存监控稳定，可以尝试 `-BatchSize 2 -GradAccumulation 8` 提升吞吐；笔记本版 12GB 建议保持默认。出现 OOM 时先缩短异常长音频，不要把 batch 降到 0；默认已经是最小 batch。LoRA 只减少可训练参数及优化器状态，不保证低显存：基础模型和激活仍占显存。目前关闭 GPT 梯度检查点，避免冻结输入及移除 `wte` 后与 PEFT 的输入梯度钩子冲突。
+
+训练时可在另一个 PowerShell 观察显存：
+
+```powershell
+nvidia-smi -l 2
+```
 
 仅训练 GPT 的 LoRA；文本嵌入、音频头、conditioning/emotion 模块和 S2Mel 不训练。不支持借此替换词表或直接扩展语言。`--language` 只是数据标记，文本规范化使用官方实现。
 

@@ -95,8 +95,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("checkpoints/config.yaml"), help="Model config YAML.")
     parser.add_argument("--base-checkpoint", type=Path, default=Path("checkpoints/gpt.pth"), help="Base GPT checkpoint.")
     parser.add_argument("--output-dir", type=Path, default=Path("trained_ckpts"), help="Directory for checkpoints/logs.")
-    parser.add_argument("--batch-size", type=int, default=4, help="Mini-batch size per optimisation step.")
-    parser.add_argument("--grad-accumulation", type=int, default=1, help="Gradient accumulation steps.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Mini-batch size per optimisation step.")
+    parser.add_argument("--grad-accumulation", type=int, default=16, help="Gradient accumulation steps.")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs.")
     parser.add_argument("--learning-rate", type=float, default=2e-5, help="Initial learning rate.")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay.")
@@ -836,7 +836,9 @@ def main() -> None:
         raise ValueError("Invalid LoRA rank, alpha or dropout.")
     configure_determinism(args.deterministic)
     set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for IndexTTS2 LoRA training.")
+    device = torch.device("cuda")
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
