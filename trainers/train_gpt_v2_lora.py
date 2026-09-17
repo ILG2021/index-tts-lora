@@ -659,7 +659,8 @@ def save_resume_artifacts(
         for name, value in serialized.items():
             output = partial / name
             torch.save(value, output)
-            with output.open("rb") as handle:
+            # Windows requires a writable file descriptor for os.fsync().
+            with output.open("r+b") as handle:
                 os.fsync(handle.fileno())
         trainer_state = {
             "schema_version": "1.0.0",
@@ -761,7 +762,8 @@ def save_latest_checkpoint(
     }
     try:
         torch.save(state, partial)
-        with partial.open("rb") as handle:
+        # Windows requires a writable file descriptor for os.fsync().
+        with partial.open("r+b") as handle:
             os.fsync(handle.fileno())
         os.replace(partial, target)
         fsync_directory(output_dir)
