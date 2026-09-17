@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert LJSpeech metadata.csv to the JSONL format used by IndexTTS2 preprocessing."""
+"""Convert two- or three-column LJSpeech metadata to IndexTTS2 JSONL."""
 
 import argparse
 import csv
@@ -18,7 +18,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--output", default="datasets/ljspeech.jsonl")
-    parser.add_argument("--text-column", choices=("normalized", "raw"), default="normalized")
+    parser.add_argument(
+        "--text-column", choices=("normalized", "raw"), default="normalized",
+        help="For three-column metadata only; two-column metadata always uses column 2.",
+    )
     parser.add_argument("--speaker", default="ljspeech")
     parser.add_argument("--language", default="en")
     args = parser.parse_args()
@@ -31,18 +34,39 @@ def main() -> None:
 
     records = []
     seen_ids = set()
-    text_index = 2 if args.text_column == "normalized" else 1
+    column_count = None
     with metadata.open("r", encoding="utf-8-sig", newline="") as source:
         for line_number, row in enumerate(csv.reader(source, delimiter="|"), 1):
-            if len(row) < 3:
-                raise ValueError(f"metadata.csv line {line_number}: expected id|raw|normalized")
-            sample_id = row[0].strip()
-            if not sample_id or sample_id in (".", "..") or re.search(r'[<>:"/\\|?*\x00-\x1f]', sample_id) or sample_id.endswith((".", " ")):
-                raise ValueError(f"metadata.csv line {line_number}: invalid sample ID {sample_id!r}")
+            if len(row) not in (2, 3):
+                raise ValueError(
+                    f"metadata.csv line {line_number}: expected filename.wav|text "
+                    "or id|raw|normalized"
+                )
+            if column_count is None:
+                column_count = len(row)
+            elif len(row) != column_count:
+                raise ValueError(
+                    f"metadata.csv line {line_number}: mixed two- and three-column rows"
+                )
+            filename_field = row[0].strip()
+            if (not filename_field or filename_field in (".", "..")
+                    or re.search(r'[<>:"/\\|?*\x00-\x1f]', filename_field)
+                    or filename_field.endswith((".", " "))):
+                raise ValueError(
+                    f"metadata.csv line {line_number}: invalid filename/ID {filename_field!r}"
+                )
+            supplied_suffix = Path(filename_field).suffix
+            if supplied_suffix and supplied_suffix.lower() != ".wav":
+                raise ValueError(
+                    f"metadata.csv line {line_number}: audio filename must end in .wav"
+                )
+            audio_filename = filename_field if supplied_suffix else f"{filename_field}.wav"
+            sample_id = Path(audio_filename).stem
             if sample_id.casefold() in seen_ids:
                 raise ValueError(f"metadata.csv line {line_number}: duplicate sample ID {sample_id!r}")
             seen_ids.add(sample_id.casefold())
-            audio = (wav_dir / f"{sample_id}.wav").resolve()
+            audio = (wav_dir / audio_filename).resolve()
+            text_index = 1 if len(row) == 2 or args.text_column == "raw" else 2
             text = " ".join(row[text_index].split())
             if not audio.is_file():
                 raise FileNotFoundError(f"metadata.csv line {line_number}: missing {audio}")
