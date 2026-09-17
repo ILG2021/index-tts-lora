@@ -214,6 +214,7 @@ WebUI 是**推理界面**，不是训练界面；训练通过命令行完成。�
 
 - `No valid prompt-target pairs`：检查该 split 的有效样本数和 speaker 分组，不要混入训练集充当验证集。
 - `Missing ... model`：先运行模型下载脚本；只下载 `gpt.pth` 不够。
+- `w2v-bert-2.0` 目录存在但提示没有 `model.safetensors`/`pytorch_model.bin`：辅助模型曾中断下载。再次运行 `.\scripts\windows\download_models.ps1`，脚本会检查真实权重并补齐。已经生成的 `datasets\ljspeech.jsonl` 不需要重做。
 - `CUDA out of memory`：降低训练 batch、缩短过长音频；LoRA 不会消除激活显存占用。
 - `LoRA keys/shape mismatch`：检查是否是本项目生成的 IndexTTS2 LoRA，而非完整 SFT、IndexTTS 1.5 或其他模块配置。
 - PowerShell 执行被阻止：仅对当前会话使用第 1 节的 `Set-ExecutionPolicy -Scope Process Bypass`，不需要全局关闭策略。

@@ -634,6 +634,19 @@ def main() -> None:
     w2v_path = args.config.parent / "hf_cache" / "w2v-bert-2.0"
     if not w2v_path.is_dir():
         raise FileNotFoundError(f"Missing downloaded Wav2Vec2-BERT model: {w2v_path}")
+    w2v_weights = (
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    )
+    if not (w2v_path / "config.json").is_file() or not any(
+        (w2v_path / name).is_file() for name in w2v_weights
+    ):
+        raise FileNotFoundError(
+            f"Incomplete Wav2Vec2-BERT model in {w2v_path}. "
+            "Run scripts/windows/download_models.ps1 to repair the download."
+        )
     semantic_extractor = SemanticExtractor(stats_path, w2v_path, device)
 
     semantic_codec = build_semantic_codec(cfg.semantic_codec)
