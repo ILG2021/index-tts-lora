@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import re
+import sys
 import wave
 from pathlib import Path, PurePosixPath
 
@@ -79,6 +80,7 @@ def main() -> None:
 
     records = []
     seen_ids = set()
+    missing_count = 0
     column_count = None
     with metadata.open("r", encoding="utf-8-sig", newline="") as source:
         for line_number, row in enumerate(csv.reader(source, delimiter="|"), 1):
@@ -114,7 +116,12 @@ def main() -> None:
             text_index = 1 if len(row) == 2 or args.text_column == "raw" else 2
             text = " ".join(row[text_index].split())
             if not audio.is_file():
-                raise FileNotFoundError(f"metadata.csv line {line_number}: missing {audio}")
+                missing_count += 1
+                print(
+                    f"[Warn] metadata.csv line {line_number}: missing audio, skipped: {audio}",
+                    file=sys.stderr,
+                )
+                continue
             if not text:
                 continue
             records.append({"id": sample_id, "text": text, "audio": str(audio),
@@ -130,7 +137,10 @@ def main() -> None:
         for record in records:
             target.write(json.dumps(record, ensure_ascii=False) + "\n")
     temporary.replace(output)
-    print(f"Wrote {len(records)} IndexTTS2 samples to {output.resolve()}")
+    print(
+        f"Wrote {len(records)} IndexTTS2 samples to {output.resolve()} "
+        f"(missing skipped: {missing_count})"
+    )
 
 
 if __name__ == "__main__":

@@ -30,6 +30,27 @@ class ConversionTests(unittest.TestCase):
             with patch.dict(sys.modules, {"soundfile": fake_soundfile}):
                 self.assertEqual(wav_duration(Path("extensible.wav")), 2.0)
 
+    def test_missing_audio_is_skipped_when_enough_samples_remain(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "wavs").mkdir()
+            for name in ("one", "three"):
+                write_wav(root / "wavs" / f"{name}.wav")
+            (root / "metadata.csv").write_text(
+                "one.wav|one\nmissing.wav|missing\nthree.wav|three\n",
+                encoding="utf-8",
+            )
+            output = root / "voice.jsonl"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--dataset-dir", str(root),
+                 "--output", str(output)], capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertIn(b"missing audio, skipped", result.stderr)
+            rows = output.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(rows), 2)
+            self.assertNotIn("missing", output.read_text(encoding="utf-8"))
+
     def test_two_column_filename_with_suffix_and_atomic_failure(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder) / "voice 中文"
