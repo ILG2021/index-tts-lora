@@ -1,8 +1,9 @@
 import json
 import os
 import sys
-import threading
 import time
+import pandas as pd
+from omegaconf import OmegaConf
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -18,18 +19,22 @@ parser.add_argument("--verbose", action="store_true", default=False, help="Enabl
 parser.add_argument("--port", type=int, default=7860, help="Port to run the web UI on")
 parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to run the web UI on")
 parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
+parser.add_argument("--config", type=str, default=None,
+                    help="Config path; use finetune_models/config_finetuned.yaml for a merged LoRA model")
+parser.add_argument("--speaker_info", type=str, default=None,
+                    help="Optional speaker_info.json generated during fine-tuning")
 cmd_args = parser.parse_args()
 
 if not os.path.exists(cmd_args.model_dir):
     print(f"Model directory {cmd_args.model_dir} does not exist. Please download the model first.")
     sys.exit(1)
 
-for file in [
-    "bigvgan_generator.pth",
-    "bpe.model",
-    "gpt.pth",
-    "config.yaml",
-]:
+config_path = cmd_args.config or os.path.join(cmd_args.model_dir, "config.yaml")
+if not os.path.isfile(config_path):
+    print(f"Required config {config_path} does not exist.")
+    sys.exit(1)
+model_config = OmegaConf.load(config_path)
+for file in [model_config.bigvgan_checkpoint, model_config.dataset.bpe_model, model_config.gpt_checkpoint]:
     file_path = os.path.join(cmd_args.model_dir, file)
     if not os.path.exists(file_path):
         print(f"Required file {file_path} does not exist. Please download it.")
@@ -41,8 +46,8 @@ from indextts.infer import IndexTTS
 from tools.i18n.i18n import I18nAuto
 
 i18n = I18nAuto(language="zh_CN")
-MODE = 'local'
-tts = IndexTTS(model_dir=cmd_args.model_dir, cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),)
+tts = IndexTTS(model_dir=cmd_args.model_dir, cfg_path=config_path,
+               speaker_info_path=cmd_args.speaker_info)
 
 
 os.makedirs("outputs/tasks",exist_ok=True)
@@ -58,11 +63,13 @@ with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
         example_cases.append([os.path.join("tests", example.get("prompt_audio", "sample_prompt.wav")),
                               example.get("text"), ["普通推理", "批次推理"][example.get("infer_mode", 0)]])
 
-def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sentences_bucket_max_size=4,
+def gen_single(prompt, text, infer_mode, speaker_id, max_text_tokens_per_sentence=120, sentences_bucket_max_size=4,
                 *args, progress=gr.Progress()):
-    output_path = None
-    if not output_path:
-        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
+    if not prompt or not os.path.isfile(prompt):
+        raise gr.Error("请上传有效的参考音频。")
+    if not text or not text.strip():
+        raise gr.Error("请输入待合成文本。")
+    output_path = os.path.join("outputs", f"spk_{time.time_ns()}.wav")
     # set gradio progress
     tts.gr_progress = progress
     do_sample, top_p, top_k, temperature, \
@@ -79,15 +86,18 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
         # "typical_sampling": bool(typical_sampling),
         # "typical_mass": float(typical_mass),
     }
+    speaker_id = speaker_id or None
     if infer_mode == "普通推理":
         output = tts.infer(prompt, text, output_path, verbose=cmd_args.verbose,
                            max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                           speaker_id=speaker_id,
                            **kwargs)
     else:
         # 批次推理
         output = tts.infer_fast(prompt, text, output_path, verbose=cmd_args.verbose,
             max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
             sentences_bucket_max_size=(sentences_bucket_max_size),
+            speaker_id=speaker_id,
             **kwargs)
     return gr.update(value=output,visible=True)
 
@@ -96,7 +106,6 @@ def update_prompt_audio():
     return update_button
 
 with gr.Blocks(title="IndexTTS Demo") as demo:
-    mutex = threading.Lock()
     gr.HTML('''
     <h2><center>IndexTTS: An Industrial-Level Controllable and Efficient Zero-Shot Text-To-Speech System</h2>
     <h2><center>(一款工业级可控且高效的零样本文本转语音系统)</h2>
@@ -109,13 +118,16 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             os.makedirs("prompts",exist_ok=True)
             prompt_audio = gr.Audio(label="参考音频",key="prompt_audio",
                                     sources=["upload","microphone"],type="filepath")
-            prompt_list = os.listdir("prompts")
-            default = ''
-            if prompt_list:
-                default = prompt_list[0]
             with gr.Column():
                 input_text_single = gr.TextArea(label="文本",key="input_text_single", placeholder="请输入目标文本", info="当前模型版本{}".format(tts.model_version or "1.0"))
                 infer_mode = gr.Radio(choices=["普通推理", "批次推理"], label="推理模式",info="批次推理：更适合长句，性能翻倍",value="普通推理")        
+                speaker_id = gr.Dropdown(
+                    choices=tts.speaker_list,
+                    value=tts.speaker_list[0] if tts.speaker_list else None,
+                    label="微调说话人",
+                    info="来自微调 checkpoint；基础模型无需选择",
+                    visible=bool(tts.speaker_list),
+                )
                 gen_button = gr.Button("生成语音", key="gen_button",interactive=True)
             output_audio = gr.Audio(label="生成结果", visible=True,key="output_audio")
         with gr.Accordion("高级生成参数设置", open=False):
@@ -200,7 +212,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                          outputs=[gen_button])
 
     gen_button.click(gen_single,
-                     inputs=[prompt_audio, input_text_single, infer_mode,
+                     inputs=[prompt_audio, input_text_single, infer_mode, speaker_id,
                              max_text_tokens_per_sentence, sentences_bucket_max_size,
                              *advanced_params,
                      ],

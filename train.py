@@ -1,7 +1,9 @@
 import copy
+import argparse
 import gc
 import os
 import random
+import math
 from datetime import datetime
 from typing import List, Optional, Tuple
 
@@ -292,7 +294,7 @@ def top_k_accuracy(logits: torch.Tensor, targets: torch.Tensor, k: Tuple[int, ..
 
 class Trainer:
     """封装 UnifiedVoice 微调过程的训练器。"""
-    def __init__(self, config: DictConfig):
+    def __init__(self, config: DictConfig, device: Optional[str] = None):
         """
         初始化训练器。
 
@@ -300,7 +302,9 @@ class Trainer:
             config (DictConfig): 从 YAML 文件加载的 OmegaConf 配置对象。
         """
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but PyTorch cannot see a CUDA device.")
         
         # 设置随机种子
         self._set_seed(self.config.train.seed)
@@ -318,9 +322,6 @@ class Trainer:
 
         # 加载模型和分词器
         self._load_models()
-
-        # 设置优化器和调度器
-        self._setup_optimizer_and_scheduler()
 
         # 初始化训练状态
         self.best_val_loss = (0, float('inf'), float('inf'))  # (epoch, text_loss, mel_loss)
@@ -454,8 +455,8 @@ class Trainer:
         
         total_text_loss, total_mel_loss = 0.0, 0.0
         total_text_tokens, total_mel_tokens = 0, 0
-        all_mel_logits, all_mel_targets = [], []
-        num_batches = 0
+        accuracy_sums = [0.0, 0.0, 0.0]
+        accuracy_tokens = 0
 
         for batch in tqdm(valid_ds, desc="Validation", dynamic_ncols=True):
             # 正确处理新的 data_batch 格式，区分 tensor 和非 tensor 数据
@@ -490,7 +491,6 @@ class Trainer:
             total_mel_loss += loss_mel.item() * batch_mel_tokens
             total_text_tokens += batch_text_tokens
             total_mel_tokens += batch_mel_tokens
-            num_batches += 1
 
             # Collect logits and targets for accuracy calculation
             # 仅使用 MEL 部分的 logits 和 targets
@@ -508,18 +508,21 @@ class Trainer:
                 if valid_mask.sum() > 0:
                     mel_logits_filtered = current_mel_logits.permute(0, 2, 1).reshape(-1, current_mel_logits.size(1))[valid_mask]
                     mel_targets_filtered = current_mel_targets.view(-1)[valid_mask]
-                    all_mel_logits.append(mel_logits_filtered)
-                    all_mel_targets.append(mel_targets_filtered)
+                    count = mel_targets_filtered.numel()
+                    accuracies = top_k_accuracy(mel_logits_filtered, mel_targets_filtered, k=(1, 10, 20))
+                    for index, accuracy in enumerate(accuracies):
+                        accuracy_sums[index] += accuracy * count
+                    accuracy_tokens += count
             
             clear_torch_cache()
 
+        if not total_text_tokens or not total_mel_tokens or not accuracy_tokens:
+            raise ValueError("Validation dataset contains no usable tokens.")
         avg_text_loss = total_text_loss / total_text_tokens
         avg_mel_loss = total_mel_loss / total_mel_tokens
         
         # 计算整体准确率
-        all_mel_logits = torch.cat(all_mel_logits, dim=0)
-        all_mel_targets = torch.cat(all_mel_targets, dim=0)
-        acc_1, acc_10, acc_20 = top_k_accuracy(all_mel_logits, all_mel_targets, k=(1, 10, 20))
+        acc_1, acc_10, acc_20 = [value / accuracy_tokens for value in accuracy_sums]
 
         logger.info(f"**Validation results at epoch {epoch + 1}**")
         logger.info(f"Text Loss: {avg_text_loss:.4f}, Mel Loss: {avg_mel_loss:.4f}")
@@ -588,18 +591,21 @@ class Trainer:
         train_cfg = self.config.train
         total_ds_count = len(train_ds)
         
-        samples_per_epoch = total_ds_count
-        total_update_steps = samples_per_epoch * train_cfg.epochs
+        batches_per_epoch = total_ds_count
+        accumulation_steps = max(1, int(train_cfg.gradient_accumulation_steps))
+        total_update_steps = math.ceil(batches_per_epoch / accumulation_steps) * train_cfg.epochs
         self._setup_optimizer_and_scheduler(num_training_steps=total_update_steps)
         
         logger.info(f"Starting training for {train_cfg.epochs} epochs.")
-        logger.info(f"Total samples per epoch: {samples_per_epoch}")
+        logger.info(f"Total batches per epoch: {batches_per_epoch}")
+        logger.info(f"Gradient accumulation steps: {accumulation_steps}")
         logger.info(f"Total update steps: {total_update_steps}")
 
         text_weight = train_cfg.text_weight
 
         for epoch in range(train_cfg.epochs):
             logger.info(f"EPOCH {epoch + 1}/{train_cfg.epochs} started" + "=" * 30)
+            self.optimizer.zero_grad(set_to_none=True)
 
             for batch_idx, batch in enumerate(train_ds):
                 # 正确处理新的 data_batch 格式，区分 tensor 和非 tensor 数据
@@ -615,16 +621,22 @@ class Trainer:
 
                 weighted_loss = text_weight * loss_text + (1.0 - text_weight) * loss_mel
                 if torch.isnan(weighted_loss) or torch.isinf(weighted_loss):
-                    logger.warning(f"NaN or Inf loss at epoch {epoch}, batch {batch_idx}. Skipping.")
-                    continue
+                    self.optimizer.zero_grad(set_to_none=True)
+                    raise FloatingPointError(f"Non-finite loss at epoch {epoch + 1}, batch {batch_idx + 1}")
 
                 # ------------------ Optimisation Step ------------------
-                self.optimizer.zero_grad()
-                weighted_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), train_cfg.max_grad_norm)
-                self.optimizer.step()
-                self.scheduler.step()
-                self.update_steps += 1
+                group_start = (batch_idx // accumulation_steps) * accumulation_steps
+                group_size = min(accumulation_steps, len(train_ds) - group_start)
+                (weighted_loss / group_size).backward()
+                should_step = (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_ds)
+                if should_step:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), train_cfg.max_grad_norm)
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.update_steps += 1
+                else:
+                    grad_norm = torch.tensor(0.0)
 
                 # Logging
                 logger.info(
@@ -672,7 +684,16 @@ class Trainer:
                     f"text_loss: {self.best_val_loss[1]:.4f}, mel_loss: {self.best_val_loss[2]:.4f}")
 
 def main():
-    config_path = "finetune_models/config.yaml"
+    parser = argparse.ArgumentParser(description="Fine-tune IndexTTS GPT with LoRA/LoRA+.")
+    parser.add_argument("--config", default="finetune_models/config.yaml")
+    parser.add_argument("--device", choices=["cuda", "cpu"], default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--valid-batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader workers; defaults to 0 on Windows and 4 elsewhere.")
+    args = parser.parse_args()
+
+    config_path = args.config
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found at {config_path}.")
     
@@ -681,10 +702,21 @@ def main():
 
     # 使用新的多说话人数据加载函数，传递BPE路径而不是对象
     train_ds, valid_ds = load_finetune_datasets(config, bpe_model_path) 
-    train_ds = DataLoader(train_ds, batch_size=16, shuffle=True, collate_fn=collate_finetune_fn, num_workers=4)
-    valid_ds = DataLoader(valid_ds, batch_size=8, shuffle=False, collate_fn=collate_finetune_fn, num_workers=2)
+    if not len(train_ds) or not len(valid_ds):
+        raise ValueError("Train and validation datasets must both contain usable samples (1–20 seconds).")
+    default_workers = 0 if os.name == "nt" else 4
+    num_workers = args.num_workers if args.num_workers is not None else config.train.get("num_workers", default_workers)
+    batch_size = args.batch_size if args.batch_size is not None else config.train.get("batch_size", 4)
+    valid_batch_size = args.valid_batch_size if args.valid_batch_size is not None else config.train.get("valid_batch_size", batch_size)
+    if batch_size < 1 or valid_batch_size < 1 or num_workers < 0:
+        parser.error("Batch sizes must be positive and num-workers must be nonnegative.")
+    loader_kwargs = {"num_workers": num_workers, "pin_memory": torch.cuda.is_available()}
+    train_ds = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                          collate_fn=collate_finetune_fn, **loader_kwargs)
+    valid_ds = DataLoader(valid_ds, batch_size=valid_batch_size, shuffle=False,
+                          collate_fn=collate_finetune_fn, **loader_kwargs)
 
-    trainer = Trainer(config)
+    trainer = Trainer(config, args.device)
     trainer.train(train_ds, valid_ds)
     logger.info("Finetuning UnifiedVoice completed.")
 

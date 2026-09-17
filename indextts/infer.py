@@ -55,7 +55,7 @@ class IndexTTS:
         elif torch.cuda.is_available():
             self.device = "cuda:0"
             self.is_fp16 = is_fp16
-            self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
+            self.use_cuda_kernel = (os.name != "nt") if use_cuda_kernel is None else use_cuda_kernel
         elif hasattr(torch, "mps") and torch.backends.mps.is_available():
             self.device = "mps"
             self.is_fp16 = False # Use float16 on MPS is overhead than float32
@@ -86,7 +86,7 @@ class IndexTTS:
         # print(">> vqvae weights restored from:", self.dvae_path)
         self.gpt = UnifiedVoice(**self.cfg.gpt)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
-        load_checkpoint(self.gpt, self.gpt_path)
+        checkpoint_info = load_checkpoint(self.gpt, self.gpt_path)
         self.gpt = self.gpt.to(self.device)
         if self.is_fp16:
             self.gpt.eval().half()
@@ -145,18 +145,20 @@ class IndexTTS:
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
         
         # 初始化多说话人支持
-        self.speaker_list = []
+        self.speaker_list = list(checkpoint_info.get("speakers", []))
         if speaker_info_path and os.path.exists(speaker_info_path):
             try:
                 with open(speaker_info_path, 'r', encoding='utf-8') as f:
                     speaker_info = json.load(f)
                 # speaker_info.json 是一个数组，每个元素包含 speaker 字段
-                self.speaker_list = [item['speaker'] for item in speaker_info if 'speaker' in item]
+                requested_speakers = [item['speaker'] for item in speaker_info if 'speaker' in item]
+                self.speaker_list = [speaker for speaker in requested_speakers
+                                     if hasattr(self.gpt, f"mean_condition_{speaker}")]
                 print(f">> Multi-speaker support enabled with {len(self.speaker_list)} speakers: {self.speaker_list}")
             except Exception as e:
                 print(f">> Failed to load speaker_info from {speaker_info_path}: {e}")
-                self.speaker_list = []
-        else:
+                self.speaker_list = list(checkpoint_info.get("speakers", []))
+        elif not self.speaker_list:
             print(">> Single-speaker mode (no speaker_info_path provided)")
 
     def remove_long_silence(self, codes: torch.Tensor, silent_token=52, max_consecutive=30):
@@ -305,7 +307,8 @@ class IndexTTS:
             self.gr_progress(value, desc=desc)
 
     # 快速推理：对于“多句长文本”，可实现至少 2~10 倍以上的速度提升~ （First modified by sunnyboxs 2025-04-16）
-    def infer_fast(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_sentence=100, sentences_bucket_max_size=4, **generation_kwargs):
+    def infer_fast(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_sentence=100,
+                   sentences_bucket_max_size=4, speaker_id=None, **generation_kwargs):
         """
         Args:
             ``max_text_tokens_per_sentence``: 分句的最大token数，默认``100``，可以根据GPU硬件情况调整
@@ -315,6 +318,11 @@ class IndexTTS:
                 - 越大，bucket数量越少，batch越多，推理速度越*快*，占用内存更多，可能影响质量
                 - 越小，bucket数量越多，batch越少，推理速度越*慢*，占用内存和质量更接近于非快速推理
         """
+        if speaker_id is not None:
+            if not self.speaker_list:
+                raise ValueError("Multi-speaker support not enabled by this checkpoint.")
+            if speaker_id not in self.speaker_list:
+                raise ValueError(f"Invalid speaker_id: {speaker_id}. Available speakers: {self.speaker_list}")
         print(">> start fast inference...")
         
         self._set_gr_progress(0, "start fast inference...")
@@ -414,6 +422,7 @@ class IndexTTS:
                 with torch.amp.autocast(batch_text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
                     temp_codes = self.gpt.inference_speech(auto_conditioning, batch_text_tokens,
                                         cond_mel_lengths=cond_mel_lengths,
+                                        speaker_ids=[speaker_id] * batch_num if speaker_id else None,
                                         # text_lengths=text_len,
                                         do_sample=do_sample,
                                         top_p=top_p,
@@ -462,6 +471,7 @@ class IndexTTS:
                                         torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), codes,
                                         code_lens*self.gpt.mel_length_compression,
                                         cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]], device=text_tokens.device),
+                                        speaker_ids=[speaker_id] if speaker_id else None,
                                         return_latent=True, clip_inputs=False)
                         gpt_forward_time += time.perf_counter() - m_start_time
                         all_latents.append(latent)

@@ -1,4 +1,6 @@
 # index-tts-lora
+
+> Windows 用户请优先阅读：[Windows + LJSpeech 完整微调指南](WINDOWS_LJSPEECH_GUIDE.md)。该指南覆盖环境安装、模型文件放置、LJSpeech 转换、特征提取、LoRA 训练以及微调权重推理。
 本项目基于 Bilibili 的 [index-tts](https://github.com/index-tts/index-tts) ，提供 **LoRA 单说话人 / 多说话人** 的微调方案，用于提升精品说话人合成音频的 **韵律和自然度**。
 
 ### 训练与推理

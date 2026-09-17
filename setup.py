@@ -3,9 +3,13 @@ import platform
 import os
 from setuptools import find_packages, setup
 
-# add fused `anti_alias_activation` cuda extension if CUDA is available
+# The fused kernel is optional.  Building it during ``pip install`` is fragile on
+# Windows (Visual Studio, nvcc and the PyTorch ABI all have to match), so Windows
+# defaults to the portable PyTorch implementation.  Advanced users can opt in
+# with INDEXTTS_BUILD_CUDA_EXT=1.
 anti_alias_activation_cuda_ext = None
-if  platform.system() != "Darwin":
+build_cuda_ext = platform.system() == "Linux" or os.environ.get("INDEXTTS_BUILD_CUDA_EXT") == "1"
+if build_cuda_ext:
     try:
         from torch.utils import cpp_extension
         if cpp_extension.CUDA_HOME is not None:
@@ -30,8 +34,10 @@ if  platform.system() != "Darwin":
             )
         else:
             print("CUDA_HOME is not set. Skipping anti_alias_activation CUDA extension.")
-    except ImportError:
-        print("PyTorch is not installed. Skipping torch extension.")
+    except (ImportError, OSError) as exc:
+        print(f"CUDA extension unavailable ({exc}). Using the portable implementation.")
+else:
+    print("Skipping optional CUDA extension (Windows-safe default).")
 
 setup(
     name="indextts",
@@ -45,8 +51,8 @@ setup(
     packages=find_packages(),
     include_package_data=True,
     install_requires=[
-        "torch>=2.1.2",
-        "torchaudio",
+        "torch==2.8.0",
+        "torchaudio==2.8.0",
         "transformers==4.36.2",
         "accelerate",
         "tokenizers==0.15.0",

@@ -33,7 +33,7 @@ from indextts.vqvae.xtts_dvae import DiscreteVAE
 
 # 常量定义
 DEFAULT_OUTPUT_DIR = "finetune_data/processed_data/"
-DEFAULT_MODEL_PATH = "checkpoints/gpt.pth.open_source"
+DEFAULT_MODEL_PATH = "finetune_models/gpt.pth"
 FINETUNE_MODEL_DIR = "finetune_models"
 CONFIG_FILENAME = "config.yaml"
 METADATA_FILENAME = "metadata.jsonl"
@@ -45,7 +45,7 @@ class AudioProcessor:
     """音频处理器类，封装音频特征提取相关功能"""
     
     def __init__(self, dvae: DiscreteVAE, mel_config: Dict, device: str = 'cuda'):
-        self.dvae = dvae
+        self.dvae = dvae.to(device).eval()
         self.mel_config = mel_config
         self.device = device
         self.mel_feature = MelSpectrogramFeatures(**mel_config)
@@ -69,6 +69,11 @@ class AudioProcessor:
         # 数据类型转换
         if isinstance(audio, np.ndarray):
             audio = torch.from_numpy(audio)
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0)
+        if audio.ndim != 2 or audio.shape[-1] == 0:
+            raise ValueError("Expected nonempty audio with shape (channels, samples)")
+        audio = audio.float().mean(dim=0, keepdim=True)
         
         # 重采样
         if sr != self.mel_config['sample_rate']:
@@ -79,7 +84,7 @@ class AudioProcessor:
             audio = resampler(audio)
         
         # 提取梅尔频谱特征
-        mel = self.mel_feature(audio)
+        mel = self.mel_feature(audio).to(self.device)
         
         # 获取离散代码本索引
         codes = self.dvae.get_codebook_indices(mel)
@@ -357,7 +362,9 @@ def split_dataset(
     np.random.shuffle(lines)
 
     # 计算分割点
-    valid_size = int(len(lines) * (1 - TRAIN_SPLIT_RATIO))
+    if len(lines) < 2:
+        raise ValueError("至少需要 2 条有效音频，才能划分训练集和验证集。")
+    valid_size = max(1, int(len(lines) * (1 - TRAIN_SPLIT_RATIO)))
 
     
     # 分割数据
@@ -409,6 +416,9 @@ def save_speaker_info(
     else:
         speaker_info_list = []
     
+    # Re-running preprocessing for the same speaker should replace the stale
+    # record instead of silently training on duplicate entries.
+    speaker_info_list = [item for item in speaker_info_list if item.get("speaker") != speaker_info["speaker"]]
     speaker_info_list.append(speaker_info)
     
     # 保存更新后的信息
@@ -584,10 +594,10 @@ def main():
     config = OmegaConf.load(config_path)
     
     # 设置输出目录
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     audio_list_name = Path(args.audio_list).stem
     output_dir = os.path.join(args.output_dir, f"{audio_list_name}_{timestamp}")
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=False)
     
     # 设置模型
     dvae, unified_voice_model = setup_models(config, args)
@@ -614,7 +624,7 @@ def main():
             )
             save_medoid_results(medoid_result, output_dir)
         except Exception as e:
-            logger.error(f"计算medoid时出错: {e}")
+            raise RuntimeError("Failed to compute speaker condition") from e
     
     # 分割数据集
     split_dataset(metadata_file, output_dir)
@@ -622,7 +632,8 @@ def main():
     # 保存说话人信息
     with open(metadata_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
-    save_speaker_info(args.audio_list, output_dir, lines)
+    if args.extract_condition:
+        save_speaker_info(args.audio_list, output_dir, lines)
 
 
 if __name__ == "__main__":
