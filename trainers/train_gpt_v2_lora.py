@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--warmup-steps", type=int, default=1000, help="LR warmup steps.")
     parser.add_argument("--max-steps", type=int, default=0, help="Optional max optimiser steps (0 = unlimited).")
-    parser.add_argument("--log-interval", type=int, default=100, help="Steps between training log entries.")
+    parser.add_argument("--log-interval", type=int, default=1, help="Steps between training log entries.")
     parser.add_argument("--val-interval", type=int, default=0, help="Validation frequency in optimizer steps (0 = auto, once per epoch).")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clipping value.")
