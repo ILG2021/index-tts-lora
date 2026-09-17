@@ -60,6 +60,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
+from tqdm.auto import tqdm
 from transformers import get_cosine_schedule_with_warmup
 
 
@@ -793,7 +794,10 @@ def dataset_fingerprint(dataset: GPTPairDataset, *, label: str) -> Dict[str, obj
                 (f"{sample.id}:emotion", sample.emo_vec_path),
             )
         )
-    return aggregate_file_fingerprint(entries, label=label)
+    return aggregate_file_fingerprint(
+        tqdm(entries, desc=f"Checking {label}", unit="file", dynamic_ncols=True),
+        label=label,
+    )
 
 
 def evaluate(
@@ -1108,6 +1112,13 @@ def main() -> None:
         # after the next training step to avoid running validation before training.
         print("[Info] Skipping startup validation; will evaluate after next training interval.")
 
+    progress = tqdm(
+        total=total_steps,
+        initial=min(global_step, total_steps),
+        desc="Training",
+        unit="step",
+        dynamic_ncols=True,
+    )
     for epoch in range(start_epoch, args.epochs):
         for batch_idx, batch in enumerate(train_loader):
             with torch.cuda.amp.autocast(enabled=use_amp):
@@ -1147,13 +1158,20 @@ def main() -> None:
                 scheduler.step()
 
                 global_step += 1
+                progress.update(1)
+                progress.set_postfix(
+                    epoch=f"{epoch + 1}/{args.epochs}",
+                    text_loss=f"{text_loss.item():.4f}",
+                    mel_loss=f"{mel_loss.item():.4f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                )
 
                 if global_step % args.log_interval == 0:
                     writer.add_scalar("train/text_loss", text_loss.item(), global_step)
                     writer.add_scalar("train/mel_loss", mel_loss.item(), global_step)
                     writer.add_scalar("train/mel_top1", metrics["mel_top1"], global_step)
                     writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
-                    print(
+                    progress.write(
                         f"[Train] epoch={epoch + 1} step={global_step} "
                         f"text_loss={text_loss.item():.4f} mel_loss={mel_loss.item():.4f} "
                         f"mel_top1={metrics['mel_top1']:.4f} lr={scheduler.get_last_lr()[0]:.2e}"
@@ -1170,7 +1188,7 @@ def main() -> None:
                     writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
                     writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
                     writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
-                    print(
+                    progress.write(
                         f"[Val] epoch={epoch + 1} step={global_step} "
                         f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
                         f"mel_top1={val_metrics['mel_top1']:.4f}"
@@ -1243,9 +1261,11 @@ def main() -> None:
                     recent_checkpoints,
                     manifest_metadata,
                 )
-            print(f"[Checkpoint] saved {epoch_ckpt_path.name}")
+            progress.write(f"[Checkpoint] saved {epoch_ckpt_path.name}")
             last_saved_step = global_step
 
+
+    progress.close()
 
     if global_step > 0 and last_saved_step != global_step:
         ckpt_path = output_dir / f"model_step{global_step}.pth"
