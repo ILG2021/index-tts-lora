@@ -55,6 +55,8 @@ D:\datasets\LJSpeech-1.1\
 .\scripts\windows\prepare_ljspeech.ps1 -DatasetDir "D:\datasets\LJSpeech-1.1"
 ```
 
+Windows 脚本默认按中文数据运行（`-Language zh`），日志应显示 `Preprocessing [zh]`。英文或日文数据可显式传入 `-Language en` 或 `-Language ja`。脚本开始时会检查基础模型和辅助模型，缺失或下载不完整时自动补下载。
+
 流程依次执行：
 
 1. 将 `metadata.csv` 转为 IndexTTS2 JSONL；
@@ -65,8 +67,8 @@ D:\datasets\LJSpeech-1.1\
 最终训练文件为：
 
 ```text
-processed_data/ljspeech/gpt_pairs_train.jsonl
-processed_data/ljspeech/gpt_pairs_val.jsonl
+processed_data/ljspeech_zh/gpt_pairs_train.jsonl
+processed_data/ljspeech_zh/gpt_pairs_val.jsonl
 ```
 
 ## 4. LoRA 训练
@@ -85,8 +87,8 @@ processed_data/ljspeech/gpt_pairs_val.jsonl
 
 ```powershell
 python train.py `
-  --train-manifest processed_data\ljspeech\gpt_pairs_train.jsonl `
-  --val-manifest processed_data\ljspeech\gpt_pairs_val.jsonl `
+  --train-manifest processed_data\ljspeech_zh\gpt_pairs_train.jsonl `
+  --val-manifest processed_data\ljspeech_zh\gpt_pairs_val.jsonl `
   --tokenizer checkpoints\bpe.model `
   --config checkpoints\config.yaml `
   --base-checkpoint checkpoints\gpt.pth `

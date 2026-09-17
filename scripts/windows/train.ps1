@@ -1,5 +1,5 @@
 param(
-    [string]$ProcessedDir = "processed_data/ljspeech",
+    [string]$ProcessedDir = "processed_data/ljspeech_zh",
     [int]$BatchSize = 1,
     [int]$GradAccumulation = 16,
     [int]$Epochs = 10

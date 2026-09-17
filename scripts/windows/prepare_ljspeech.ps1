@@ -1,13 +1,17 @@
 param(
     [Parameter(Mandatory=$true)][string]$DatasetDir,
     [string]$Output = "datasets/ljspeech.jsonl",
-    [string]$ProcessedDir = "processed_data/ljspeech"
+    [string]$ProcessedDir = "processed_data/ljspeech_zh",
+    [ValidateSet("zh", "en", "ja")][string]$Language = "zh"
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot "..\.."))
-& .\.venv\Scripts\python.exe tools\prepare_ljspeech.py --dataset-dir $DatasetDir --output $Output
+Write-Host "Checking IndexTTS2 base and auxiliary models..."
+& (Join-Path $PSScriptRoot "download_models.ps1")
+if ($LASTEXITCODE -ne 0) { throw "Model check/download failed; preprocessing was not started." }
+& .\.venv\Scripts\python.exe tools\prepare_ljspeech.py --dataset-dir $DatasetDir --output $Output --language $Language
 if ($LASTEXITCODE -ne 0) { throw "LJSpeech conversion failed; extraction was not started." }
-& .\.venv\Scripts\python.exe tools\preprocess_data_v2.py --manifest $Output --output-dir $ProcessedDir --tokenizer checkpoints\bpe.model --config checkpoints\config.yaml --gpt-checkpoint checkpoints\gpt.pth --language en --device cuda --workers 0
+& .\.venv\Scripts\python.exe tools\preprocess_data_v2.py --manifest $Output --output-dir $ProcessedDir --tokenizer checkpoints\bpe.model --config checkpoints\config.yaml --gpt-checkpoint checkpoints\gpt.pth --language $Language --device cuda --workers 0
 if ($LASTEXITCODE -ne 0) { throw "IndexTTS2 feature extraction failed." }
 & .\.venv\Scripts\python.exe tools\build_gpt_prompt_pairs.py --manifest "$ProcessedDir\train_manifest.jsonl" --output "$ProcessedDir\gpt_pairs_train.jsonl"
 if ($LASTEXITCODE -ne 0) { throw "Training pair generation failed." }

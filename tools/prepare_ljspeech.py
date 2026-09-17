@@ -69,7 +69,7 @@ def main() -> None:
         help="For three-column metadata only; two-column metadata always uses column 2.",
     )
     parser.add_argument("--speaker", default="ljspeech")
-    parser.add_argument("--language", default="en")
+    parser.add_argument("--language", default="zh")
     args = parser.parse_args()
 
     root = Path(args.dataset_dir).expanduser().resolve()

@@ -68,7 +68,7 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(first["text"], "text one")
             self.assertEqual(Path(first["audio"]).name, "one.wav")
             self.assertEqual(first["speaker"], "ljspeech")
-            self.assertEqual(first["language"], "en")
+            self.assertEqual(first["language"], "zh")
             self.assertAlmostEqual(first["duration"], 0.1)
             self.assertTrue(Path(first["audio"]).is_absolute())
 

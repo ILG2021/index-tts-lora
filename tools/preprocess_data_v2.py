@@ -142,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--language",
         type=str,
-        default="en",
+        default="zh",
         help="Dataset language label; normalization uses the official tokenizer.",
     )
     parser.add_argument(
