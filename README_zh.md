@@ -114,6 +114,14 @@ checkpoint 写入 `trained_ckpts`。不要默认选择 `latest.pth`；应结合�
   -LoraCheckpoint "trained_ckpts\你实际生成的checkpoint文件名.pth"
 ```
 
+通过反向代理部署到子路径时，可指定 Gradio 的根路径：
+
+```powershell
+.\scripts\windows\webui_finetuned.ps1 `
+  -LoraCheckpoint "trained_ckpts\你实际生成的checkpoint文件名.pth" `
+  -RootPath "/indextts2"
+```
+
 访问 `http://127.0.0.1:7860`，上传说话人参考音频、输入文本并生成。也可以测试基础模型：
 
 ```powershell

@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument(
+        "--root-path",
+        default="",
+        help="URL subpath used when serving Gradio behind a reverse proxy.",
+    )
     parser.add_argument("--share", action="store_true")
     return parser.parse_args()
 
@@ -290,4 +295,5 @@ if __name__ == "__main__":
     demo = build_demo()
     demo.queue(default_concurrency_limit=1).launch(server_name=args.host,
                                                    server_port=args.port,
+                                                   root_path=args.root_path or None,
                                                    share=args.share)
