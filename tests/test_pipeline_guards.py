@@ -49,6 +49,35 @@ class PipelineGuards(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("entry", ROOT / "train.py")
         spec.loader.exec_module(importlib.util.module_from_spec(spec))
 
+    def test_webui_uses_indextts2_inference_contract(self):
+        source = (ROOT / "webui.py").read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        imports = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "indextts.infer_v2"
+            for alias in node.names
+        }
+        self.assertIn("IndexTTS2", imports)
+
+        synthesize = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "synthesize"
+        )
+        infer_call = next(
+            node for node in ast.walk(synthesize)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "infer"
+        )
+        keyword_names = {keyword.arg for keyword in infer_call.keywords}
+        self.assertTrue({
+            "spk_audio_prompt", "emo_audio_prompt", "emo_vector",
+            "use_emo_text", "max_mel_tokens",
+            "max_text_tokens_per_segment",
+        }.issubset(keyword_names))
+        self.assertIn("engine.gpt.inference_model.transformer = merged", source)
+
     def test_project_python_syntax(self):
         paths = [ROOT / "train.py", ROOT / "webui.py"]
         for directory in ("tools", "trainers", "tests"):
