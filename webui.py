@@ -253,7 +253,7 @@ def build_demo() -> gr.Blocks:
                     format="wav",
                 )
             with gr.Column():
-                result = gr.Audio(label="生成结果", type="filepath")
+                result = gr.Audio(label="生成结果", type="filepath", autoplay=True)
                 generate = gr.Button("生成语音", variant="primary")
         text = gr.TextArea(label="目标文本", lines=5, placeholder="请输入需要合成的文本")
 
@@ -476,7 +476,7 @@ if __name__ == "__main__":
                         format="wav",
                     )
                 with gr.Column():
-                    result = gr.Audio(label="生成结果", type="filepath")
+                    result = gr.Audio(label="生成结果", type="filepath", autoplay=True)
                     generate_btn = gr.Button("生成语音", variant="primary")
 
             text = gr.TextArea(label="目标文本", lines=5, placeholder="请输入需要合成的文本")
