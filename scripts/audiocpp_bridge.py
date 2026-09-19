@@ -176,7 +176,12 @@ class AudioCppBridge:
                    "session_options": session_options}]
         config = {
             "host": self.host, "port": self.port, "backend": self.backend,
-            "lazy_load": True, "max_loaded_models": 1, "models": models,
+            "lazy_load": True,
+            "max_loaded_models": 1,
+            # 多人请求在同一模型实例前无限期排队，不因默认 300 秒等待上限
+            # 返回 503。模型内部仍由 BusyGuard 保证串行执行。
+            "busy_timeout_ms": 0,
+            "models": models,
         }
         handle = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="indextts2-audiocpp-",
@@ -488,7 +493,10 @@ class AudioCppBridge:
             if emo_path:
                 request_body["audio"] = str(emo_path)
             response = requests.post(
-                f"{self._base_url}{_TTS_ENDPOINT}", json=request_body, timeout=120,
+                # IndexTTS2 长文本/CPU 推理可能远超两分钟。这里不设置客户端
+                # 总超时，由 Gradio 队列一直等待 server 返回，避免误触发 CLI
+                # 回退后与仍在运行的 server 同时争抢 GPU。
+                f"{self._base_url}{_TTS_ENDPOINT}", json=request_body, timeout=None,
             )
 
             if response.status_code == 200:

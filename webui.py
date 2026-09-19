@@ -250,6 +250,7 @@ def build_demo() -> gr.Blocks:
                     label="音色参考音频",
                     sources=["upload", "microphone"],
                     type="filepath",
+                    format="wav",
                 )
             with gr.Column():
                 result = gr.Audio(label="生成结果", type="filepath")
@@ -263,7 +264,11 @@ def build_demo() -> gr.Blocks:
                 label="情感控制方式",
             )
             with gr.Group(visible=False) as emotion_audio_group:
-                emotion_audio = gr.Audio(label="情感参考音频", type="filepath")
+                emotion_audio = gr.Audio(
+                    label="情感参考音频",
+                    type="filepath",
+                    format="wav",
+                )
             with gr.Group(visible=False) as emotion_vector_group:
                 with gr.Row():
                     joy = gr.Slider(0, 1, 0, step=0.05, label="喜")
@@ -468,6 +473,7 @@ if __name__ == "__main__":
                         label="音色参考音频",
                         sources=["upload", "microphone"],
                         type="filepath",
+                        format="wav",
                     )
                 with gr.Column():
                     result = gr.Audio(label="生成结果", type="filepath")
@@ -499,7 +505,11 @@ if __name__ == "__main__":
                     label="情感控制方式",
                 )
                 with gr.Group(visible=False) as emotion_audio_group:
-                    emotion_audio = gr.Audio(label="情感参考音频", type="filepath")
+                    emotion_audio = gr.Audio(
+                        label="情感参考音频",
+                        type="filepath",
+                        format="wav",
+                    )
                 with gr.Group(visible=False) as emotion_vector_group:
                     with gr.Row():
                         joy = gr.Slider(0, 1, 0, step=0.05, label="喜 (Joy)")

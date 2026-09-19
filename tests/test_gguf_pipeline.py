@@ -212,6 +212,7 @@ class TestLoraSwitching(unittest.TestCase):
             import json
             config = json.loads(Path(cmd[2]).read_text(encoding="utf-8"))
             self.assertEqual([m["id"] for m in config["models"]], ["index_tts2"])
+            self.assertEqual(config["busy_timeout_ms"], 0)
             self.assertEqual(
                 config["models"][0]["session_options"],
                 {
