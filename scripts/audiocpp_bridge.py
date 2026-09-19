@@ -35,6 +35,7 @@ import atexit
 import io
 import json
 import logging
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -84,6 +85,24 @@ def _validate_wav_audio(data: bytes, source: str) -> None:
                 raise InferenceError(f"{source} 返回的 WAV 参数无效")
     except (EOFError, wave.Error) as exc:
         raise InferenceError(f"{source} 返回的内容不是有效 WAV：{exc}") from exc
+
+
+def _stage_audio_ascii(source: Path) -> Path:
+    """复制到 ASCII 临时路径，规避 Windows C++ 窄字符路径的代码页错误。"""
+    suffix = source.suffix if source.suffix.isascii() else ".wav"
+    handle = tempfile.NamedTemporaryFile(
+        prefix="audiocpp-audio-",
+        suffix=suffix,
+        delete=False,
+    )
+    staged = Path(handle.name)
+    handle.close()
+    try:
+        shutil.copyfile(source, staged)
+    except Exception:
+        staged.unlink(missing_ok=True)
+        raise
+    return staged
 
 
 class AudioCppBridge:
@@ -311,6 +330,15 @@ class AudioCppBridge:
         if not voice_ref_path.is_file():
             raise ValueError(f"说话人参考音频不存在：{voice_ref_path}")
 
+        staged_voice_ref = _stage_audio_ascii(voice_ref_path)
+        staged_emotion_audio = None
+        if emotion_audio:
+            emotion_source = Path(emotion_audio).resolve()
+            if not emotion_source.is_file():
+                staged_voice_ref.unlink(missing_ok=True)
+                raise ValueError(f"情感参考音频不存在：{emotion_source}")
+            staged_emotion_audio = _stage_audio_ascii(emotion_source)
+
         temp_out = False
         if output_wav is None:
             import tempfile
@@ -329,7 +357,7 @@ class AudioCppBridge:
             "--model", str(self.model_path),
             "--backend", self.backend,
             "--language", language,
-            "--voice-ref", str(voice_ref_path),
+            "--voice-ref", str(staged_voice_ref),
             "--text", text,
             "--out", str(out_path),
             "--temperature", str(temperature),
@@ -351,11 +379,8 @@ class AudioCppBridge:
             cmd.extend(["--request-option", f"index_tts2.lora={lora}"])
             cmd.extend(["--request-option", f"index_tts2.lora_scale={float(lora_scale)}"])
 
-        if emotion_audio:
-            emo_path = Path(emotion_audio).resolve()
-            if not emo_path.is_file():
-                raise ValueError(f"情感参考音频不存在：{emo_path}")
-            cmd.extend(["--audio", str(emo_path)])
+        if staged_emotion_audio:
+            cmd.extend(["--audio", str(staged_emotion_audio)])
 
         if emotion:
             cmd.extend(["--emotion", emotion])
@@ -387,22 +412,27 @@ class AudioCppBridge:
             cmd.extend(extra_args)
 
         log.info("运行 audiocpp_cli：%s", " ".join(cmd))
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            if temp_out and out_path.exists():
-                out_path.unlink()
-            raise InferenceError(f"audiocpp_cli 执行失败 (code {res.returncode}): {res.stderr}")
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                if temp_out and out_path.exists():
+                    out_path.unlink()
+                raise InferenceError(f"audiocpp_cli 执行失败 (code {res.returncode}): {res.stderr}")
 
-        if not out_path.is_file() or out_path.stat().st_size == 0:
-            if temp_out and out_path.exists():
-                out_path.unlink()
-            raise InferenceError("audiocpp_cli 执行完成但未生成有效音频文件")
+            if not out_path.is_file() or out_path.stat().st_size == 0:
+                if temp_out and out_path.exists():
+                    out_path.unlink()
+                raise InferenceError("audiocpp_cli 执行完成但未生成有效音频文件")
 
-        wav_data = out_path.read_bytes()
-        if temp_out:
-            out_path.unlink()
-        _validate_wav_audio(wav_data, "audiocpp_cli")
-        return wav_data
+            wav_data = out_path.read_bytes()
+            if temp_out:
+                out_path.unlink()
+            _validate_wav_audio(wav_data, "audiocpp_cli")
+            return wav_data
+        finally:
+            staged_voice_ref.unlink(missing_ok=True)
+            if staged_emotion_audio:
+                staged_emotion_audio.unlink(missing_ok=True)
 
     def generate(
         self,
@@ -449,6 +479,9 @@ class AudioCppBridge:
             if not emo_path.is_file():
                 raise ValueError(f"情感参考音频不存在：{emo_path}")
 
+        staged_voice_ref = _stage_audio_ascii(voice_ref_path)
+        staged_emo_path = _stage_audio_ascii(emo_path) if emo_path else None
+
         try:
             self._ensure_running()
 
@@ -458,7 +491,7 @@ class AudioCppBridge:
                 # /v1/audio/speech 从顶层 language 构造 Transcript；同时保留
                 # options.language 以兼容只读取 request option 的模型族。
                 "language": language,
-                "voice_ref": str(voice_ref_path),
+                "voice_ref": str(staged_voice_ref),
                 "response_format": "wav",
             }
 
@@ -490,8 +523,8 @@ class AudioCppBridge:
 
             opts.update(extra_request_options)
             request_body["options"] = opts
-            if emo_path:
-                request_body["audio"] = str(emo_path)
+            if staged_emo_path:
+                request_body["audio"] = str(staged_emo_path)
             response = requests.post(
                 # IndexTTS2 长文本/CPU 推理可能远超两分钟。这里不设置客户端
                 # 总超时，由 Gradio 队列一直等待 server 返回，避免误触发 CLI
@@ -503,7 +536,8 @@ class AudioCppBridge:
                 _validate_wav_audio(response.content, "audiocpp_server")
                 return response.content
 
-            raise InferenceError(f"HTTP {response.status_code}: {response.text[:300]}")
+            error_text = response.content.decode("utf-8", errors="replace")
+            raise InferenceError(f"HTTP {response.status_code}: {error_text[:300]}")
 
         except Exception as e:
             if fallback_to_cli and self.cli_exe and self.cli_exe.is_file():
@@ -530,6 +564,10 @@ class AudioCppBridge:
                     max_mel_tokens=max_mel_tokens,
                 )
             raise InferenceError(f"audiocpp 推理失败：{e}") from e
+        finally:
+            staged_voice_ref.unlink(missing_ok=True)
+            if staged_emo_path:
+                staged_emo_path.unlink(missing_ok=True)
 
     def health_check(self) -> dict[str, Any]:
         """返回 server 健康状态信息。"""
