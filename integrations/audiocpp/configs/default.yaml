@@ -1,0 +1,49 @@
+# audio.cpp server 默认参数配置 (IndexTTS2)
+# 此文件供 scripts/audiocpp_bridge.py、scripts/infer_audiocpp.py 和 webui_audiocpp.ps1 参考
+
+server:
+  host: "127.0.0.1"
+  port: 8080
+  # 计算后端：cuda | hip | vulkan | metal | cpu
+  backend: cuda
+
+model:
+  family: index_tts2
+  # 权重精度：q8_0 (推荐，降低 ~50% 显存且质量无损) | f16 | bf16
+  weight_type: q8_0
+
+session:
+  # 说话人参考音频缓存 slot 数（0 = 禁用缓存，每次请求重新编码）
+  speaker_cache_slots: 1
+  # 情感参考音频缓存 slot 数
+  emotion_cache_slots: 1
+  # 请求处理后释放中间图，节省显存
+  mem_saver: false
+
+generation:
+  language: zh
+  temperature: 0.8
+  top_p: 0.8
+  top_k: 30
+  num_beams: 3
+  repetition_penalty: 10.0
+  length_penalty: 0.0
+  # 最大生成 mel token 数（1500 对应约 12 秒语音）
+  max_mel_tokens: 1500
+
+# IndexTTS2 专用情感与语速选项 (request_options)
+request_options:
+  # 情感混合权重 [0.0, 1.0]
+  emotion_alpha: 1.0
+  # 语速调节倍率（>1.0 变慢，<1.0 变快）
+  duration_factor: 1.0
+  # 标点分段间插入的静音（毫秒）
+  interval_silence_ms: 200
+  # 是否开启随机情感采样
+  use_random_emotion: false
+  # 8 维情感向量说明: [喜, 怒, 哀, 惧, 厌恶, 低落, 惊喜, 平静]
+  # default_emotion_vector: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+# 可选的未融合 LoRA adapter；基础 GGUF 只加载一次，请求按名称热切换
+# runtime_loras:
+#   speaker-a: "integrations/audiocpp/weights/voices/speaker-a.safetensors"

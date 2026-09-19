@@ -11,3 +11,8 @@ to its own source and model licenses.
 
 Changes in this project include Windows launchers, LJSpeech conversion, PEFT LoRA
 injection and adapter checkpoint loading in the Gradio interface.
+
+The optional native GGUF inference workflow integrates with
+[`0xShug0/audio.cpp`](https://github.com/0xShug0/audio.cpp), distributed under
+the MIT License. audio.cpp binaries and model weights are downloaded separately
+and remain subject to their respective licenses.

@@ -128,20 +128,74 @@ checkpoint 写入 `trained_ckpts`。不要默认选择 `latest.pth`；应结合�
 python webui.py --model-dir checkpoints --config checkpoints\config.yaml
 ```
 
-## 6. 目录说明
+## 6. audio.cpp GGUF 推理后端（参考 openmoss 架构）
+
+除默认 PyTorch 推理路径外，本项目同时支持通过 [audio.cpp](https://github.com/0xShug0/audio.cpp)（C++ / ggml 框架）进行 GGUF 格式推理，参考了 MOSS-TTS 的 `openmoss` 集成模式。audio.cpp 已原生支持 IndexTTS2 和 IndexTTS2.5。
+
+### 中国大陆连接说明
+
+audio.cpp 运行时代码**不会主动连接任何中国大陆网站**。README 中列出的 `modelscope.cn` 镜像和 `funasr.com` 链接仅供可选模型下载，不影响推理流程。
+
+### 快速开始
+
+**步骤 1：下载 audio.cpp 二进制 + 转换 GGUF（一键）**
+
+```powershell
+.\scripts\windows\setup_audiocpp.ps1
+# 带 LoRA 转换：
+.\scripts\windows\setup_audiocpp.ps1 -LoraCheckpoint trained_ckcts\你的checkpoint.pth
+```
+
+**步骤 2：启动 WebUI**
+
+```powershell
+.\scripts\windows\webui_audiocpp.ps1
+# 带 LoRA：
+.\scripts\windows\webui_audiocpp.ps1 `
+    -Lora "speaker-a=integrations\audiocpp\weights\voices\speaker-a.safetensors"
+```
+
+访问 `http://127.0.0.1:7860`，WebUI 在后台自动启动 `audiocpp_server`（C++ 进程）。
+
+### 关键文件
+
+```text
+scripts/convert_to_gguf.py           PyTorch checkpoints → GGUF
+scripts/convert_lora_adapter.py      LoRA checkpoint → 运行时 safetensors adapter
+scripts/audiocpp_bridge.py           Python ↔ C++ server 桥接层
+scripts/windows/setup_audiocpp.ps1   一键初始化（下载 + 转换 + 量化）
+scripts/windows/webui_audiocpp.ps1   audio.cpp 后端 WebUI 启动脚本
+integrations/audiocpp/               C++ 集成目录（二进制/权重/配置）
+tests/test_gguf_pipeline.py          GGUF 流程验证测试
+```
+
+### 与 openmoss 的架构对比
+
+| 要素 | MOSS-TTS openmoss | 本项目 audio.cpp 集成 |
+|------|-------------------|----------------------|
+| C++ 推理框架 | libllama + ggml | audio.cpp（ggml） |
+| 权重格式 | backbone.gguf + extras.gguf | 单 GGUF（多模块） |
+| LoRA 加载 | llama_adapter_lora | GPT-2 图内运行时 A/B adapter |
+| Python 前端 | Gradio → openmoss HTTP server | Gradio → audiocpp_server HTTP |
+| 量化 | llama-quantize Q4_K_M | audiocpp_gguf Q8_0 |
+
+详见 [integrations/audiocpp/README.md](integrations/audiocpp/README.md)。
+
+## 7. 目录说明
 
 ```text
 trainers/train_gpt_v2_lora.py   IndexTTS2 LoRA 训练器
 tools/prepare_ljspeech.py       LJSpeech 转 IndexTTS2 JSONL
 tools/preprocess_data_v2.py     IndexTTS2 特征预处理
 tools/build_gpt_prompt_pairs.py prompt/target 配对
-webui.py                        基础模型或 LoRA 推理界面
+webui.py                        基础模型或 LoRA 推理界面（支持 --backend audiocpp）
 scripts/windows/                Windows 一键脚本
+integrations/audiocpp/          audio.cpp C++ 后端集成目录
 ```
 
 参考项目是全参数 SFT。本项目对训练器做了实质修改：冻结基础 `UnifiedVoice`，只向 GPT Transformer 的 `c_attn`、`c_proj` 和 `c_fc` 注入 LoRA。相关来源与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-## 7. 数据、训练与权重使用细节
+## 8. 数据、训练与权重使用细节
 
 所有命令在项目根目录的 PowerShell 执行。不要混用 IndexTTS 1.5 的 `dvae.pth`、`bigvgan_generator.pth` 或旧预处理结果；本项目使用 IndexTTS2 的 semantic codec 与 S2Mel。
 
@@ -204,7 +258,7 @@ WebUI 是**推理界面**，不是训练界面；训练通过命令行完成。�
 
 在第 4 节的完整训练命令中追加 `--resume auto --trust-resume-state`，其余数据、模型、训练配置及输出目录保持一致。恢复仅支持带完整元数据和恢复附件的 epoch checkpoint；不要只搬一个 `.pth` 文件，也不要用 `latest.pth` 或中途 step checkpoint 恢复。`--epochs` 是总目标轮数，不是再训练多少轮。`auto` 找不到可恢复 epoch 时会从头开始，务必检查终端输出。
 
-## 8. 自检与验收边界
+## 9. 自检与验收边界
 
 无需下载权重即可执行轻量回归测试：
 
@@ -230,3 +284,7 @@ WebUI 是**推理界面**，不是训练界面；训练通过命令行完成。�
 - PowerShell 执行被阻止：仅对当前会话使用第 1 节的 `Set-ExecutionPolicy -Scope Process Bypass`，不需要全局关闭策略。
 
 安装及模型下载需要网络。下载脚本显式选择 Hugging Face，但官方运行时和依赖也可能自行下载辅助资源；此文档不保证全链路仅访问某一域名或完全离线。部署前应单独审核官方运行时、模型缓存和网络策略。
+
+## 9. audio.cpp / GGUF 推理
+
+完整流程见 [integrations/audiocpp/README.md](integrations/audiocpp/README.md)。audio.cpp 官方为 GGUF 权重提供 ModelScope 中国大陆镜像；源码仍从 GitHub 获取。本项目给 audio.cpp v0.8.1 应用 IndexTTS2 runtime LoRA patch：基础 GGUF 只加载一次，各 adapter 仅保存 GPT-2 投影层的 A/B 张量，并通过请求选项热切换。预编译的官方 v0.8.1 二进制不含此扩展，必须运行源码构建脚本。

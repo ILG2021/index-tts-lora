@@ -22,3 +22,9 @@ datasets/
 processed_data/
 trained_ckpts/
 .reference-indextts2-finetuning/
+# audio.cpp 二进制和 GGUF 权重（体积过大，不应提交）
+integrations/audiocpp/bin/
+integrations/audiocpp/weights/
+integrations/audiocpp/src/
+# 合并后的临时 checkpoints 目录
+checkpoints_*_merged/
