@@ -157,7 +157,8 @@ if (-not (Test-Path $AudioCppDir)) {
 # ── 2.1 应用 IndexTTS2 runtime LoRA 扩展 ─────────────────────────────────────
 $PatchDir = Join-Path $ProjectRoot "integrations" "audiocpp" "patches"
 $Patches = @(
-    (Join-Path $PatchDir "0001-index-tts2-runtime-lora.patch")
+    (Join-Path $PatchDir "0001-index-tts2-runtime-lora.patch"),
+    (Join-Path $PatchDir "0002-msvc-utf8.patch")
 )
 foreach ($Patch in $Patches) {
     if (-not (Test-Path $Patch)) { Write-Error "缺少 audio.cpp patch：$Patch" }

@@ -19,7 +19,8 @@ integrations/audiocpp/
 │   └── voices/                 小体积运行时 LoRA adapters
 │       └── speaker-a.safetensors
 ├── patches/
-│   └── 0001-index-tts2-runtime-lora.patch
+│   ├── 0001-index-tts2-runtime-lora.patch
+│   └── 0002-msvc-utf8.patch       MSVC 统一以 UTF-8 解析 C++ 源码
 ├── configs/
 │   └── default.yaml            audiocpp_server 常用参数与 IndexTTS2 选项
 └── scripts/
@@ -76,7 +77,7 @@ Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\nvcc.exe
 `Test-Path` 应返回 `True`，`nvcc` 应显示 `release 12.4`。这里的本地 CUDA Toolkit 用于编译 audio.cpp，与 Python 训练环境中 PyTorch wheel 自带的 CUDA runtime 版本是两个独立概念。
 
 构建脚本固定检出 audio.cpp `v0.8.1`，幂等应用
-`patches/0001-index-tts2-runtime-lora.patch`，然后运行
+`patches/0001-index-tts2-runtime-lora.patch` 和 `patches/0002-msvc-utf8.patch`，然后运行
 `scripts/sanitize_source.ps1` 清理不符合项目网络策略的上游链接，再生成带热切换能力的 CLI、server 和 GGUF 工具。audio.cpp 不作为本仓库的 submodule；`integrations/audiocpp/src/` 是可删除、可重建的本地构建目录，真正提交和维护的上游功能修改是 patch，网络策略清理由脚本完成。
 构建时显式设置 `AUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF`，不编译上游 server 的模型管理和网络下载功能；本项目运行时只从本地路径加载 GGUF 和 adapter。
 
@@ -102,6 +103,10 @@ Remove-Item `
 **提示缺少 MSVC**
 
 先确认 Visual Studio Installer 中安装了“使用 C++ 的桌面开发”。更新后的 `build.ps1` 会自动定位 VS 2022；如果仍然失败，改在“Developer PowerShell for VS 2022”中执行同一命令。
+
+**`text_normalization.cpp` 在中文标点附近报 C2015/C2017/C2001**
+
+这是 MSVC 使用系统代码页解析 UTF-8 C++ 源码导致的级联语法错误，与 CUDA 和 LoRA 计算无关。上游只给 `engine_runtime` 加了 `/utf-8`，但 `text_normalization.cpp` 由 `engine_core` object target 编译。本项目的 `0002-msvc-utf8.patch` 在全局 MSVC C++ 编译选项中加入 `/utf-8`。拉取最新项目修改后重新运行 `build.ps1` 即可，不需要修改该 C++ 文件中的中文标点。
 
 ---
 

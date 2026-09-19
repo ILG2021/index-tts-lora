@@ -1,0 +1,12 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index dcc9d28..8cb55b4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -371,6 +371,7 @@ add_compile_options(
+     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wpedantic>
+     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-pedantic-errors>
+     $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/permissive->
++    $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/utf-8>
+ )
+ 
+ set(AUDIOCPP_MODEL_SET "full" CACHE STRING "Model composite to build: full, core, or custom")
