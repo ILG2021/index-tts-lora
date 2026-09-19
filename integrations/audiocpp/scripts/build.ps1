@@ -69,20 +69,31 @@ if (-not (Test-Path $AudioCppDir)) {
 }
 
 # ── 2.1 应用 IndexTTS2 runtime LoRA 扩展 ─────────────────────────────────────
-$LoraPatch = Join-Path $ProjectRoot "integrations" "audiocpp" "patches" "0001-index-tts2-runtime-lora.patch"
-if (-not (Test-Path $LoraPatch)) { Write-Error "缺少 runtime LoRA patch：$LoraPatch" }
-& git -C $AudioCppDir apply --check $LoraPatch 2>$null
-if ($LASTEXITCODE -eq 0) {
-    & git -C $AudioCppDir apply $LoraPatch
-    if ($LASTEXITCODE -ne 0) { Write-Error "应用 IndexTTS2 runtime LoRA patch 失败" }
-    Write-Host "已应用 IndexTTS2 runtime LoRA patch" -ForegroundColor Green
-} else {
-    & git -C $AudioCppDir apply --reverse --check $LoraPatch 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "audio.cpp 源码既不能应用也不包含 runtime LoRA patch；请确认使用 v0.8.1 干净源码"
+$PatchDir = Join-Path $ProjectRoot "integrations" "audiocpp" "patches"
+$Patches = @(
+    (Join-Path $PatchDir "0001-index-tts2-runtime-lora.patch")
+)
+foreach ($Patch in $Patches) {
+    if (-not (Test-Path $Patch)) { Write-Error "缺少 audio.cpp patch：$Patch" }
+    & git -C $AudioCppDir apply --check $Patch 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        & git -C $AudioCppDir apply $Patch
+        if ($LASTEXITCODE -ne 0) { Write-Error "应用 audio.cpp patch 失败：$Patch" }
+        Write-Host "已应用 $([System.IO.Path]::GetFileName($Patch))" -ForegroundColor Green
+    } else {
+        & git -C $AudioCppDir apply --reverse --check $Patch 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "audio.cpp 源码既不能应用也不包含 patch：$Patch`n请确认使用 v0.8.1 干净源码"
+        }
+        Write-Host "$([System.IO.Path]::GetFileName($Patch)) 已存在，跳过" -ForegroundColor Gray
     }
-    Write-Host "IndexTTS2 runtime LoRA patch 已存在，跳过" -ForegroundColor Gray
 }
+
+# ── 2.2 清理上游源码中不符合项目网络策略的链接 ───────────────────
+$SanitizeScript = Join-Path $ProjectRoot "integrations" "audiocpp" "scripts" "sanitize_source.ps1"
+if (-not (Test-Path $SanitizeScript)) { Write-Error "缺少源码网络策略清理脚本：$SanitizeScript" }
+& $SanitizeScript -SourceDir $AudioCppDir
+if ($LASTEXITCODE -ne 0) { Write-Error "清理 audio.cpp 源码链接失败" }
 
 # ── 3. CMake 配置 ─────────────────────────────────────────────────────────────
 Write-Host ""
@@ -95,6 +106,8 @@ $cmakeArgs = @(
     "-DCMAKE_BUILD_TYPE=Release",
     "-DENGINE_ENABLE_CUDA=ON",
     "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
+    # 禁止编译上游模型管理/网络下载能力；本项目只加载本地 GGUF/adapter
+    "-DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF",
     # 只编译 core + index_tts2，减少编译时间
     "-DAUDIOCPP_MODEL_SET=custom",
     "-DAUDIOCPP_MODELS=index_tts2",

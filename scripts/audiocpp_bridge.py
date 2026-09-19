@@ -218,10 +218,11 @@ class AudioCppBridge:
                 self._proc.kill()
                 self._proc = None
                 self._owned_proc = False
-            if self._config_path and self._config_path.exists():
-                self._config_path.unlink()
-                self._config_path = None
                 raise
+            finally:
+                if self._config_path and self._config_path.exists():
+                    self._config_path.unlink()
+                self._config_path = None
 
             log.info("audiocpp_server 已就绪（%s）", self._base_url)
 

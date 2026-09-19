@@ -134,7 +134,7 @@ python webui.py --model-dir checkpoints --config checkpoints\config.yaml
 
 ### 中国大陆连接说明
 
-audio.cpp 运行时代码**不会主动连接任何中国大陆网站**。README 中列出的 `modelscope.cn` 镜像和 `funasr.com` 链接仅供可选模型下载，不影响推理流程。
+本项目禁止链接或自动访问中国大陆网站。源码、发行二进制和模型下载脚本只配置 GitHub、Hugging Face 和 PyTorch 官方来源；部署时仍应按所在网络的合规策略审核 DNS、代理和依赖包自身的下载行为。
 
 ### 快速开始
 
@@ -287,4 +287,4 @@ WebUI 是**推理界面**，不是训练界面；训练通过命令行完成。�
 
 ## 9. audio.cpp / GGUF 推理
 
-完整流程见 [integrations/audiocpp/README.md](integrations/audiocpp/README.md)。audio.cpp 官方为 GGUF 权重提供 ModelScope 中国大陆镜像；源码仍从 GitHub 获取。本项目给 audio.cpp v0.8.1 应用 IndexTTS2 runtime LoRA patch：基础 GGUF 只加载一次，各 adapter 仅保存 GPT-2 投影层的 A/B 张量，并通过请求选项热切换。预编译的官方 v0.8.1 二进制不含此扩展，必须运行源码构建脚本。
+完整流程见 [integrations/audiocpp/README.md](integrations/audiocpp/README.md)。audio.cpp 源码和发行二进制从 GitHub 获取，模型权重仅使用本项目明确允许的来源。本项目给 audio.cpp v0.8.1 应用 IndexTTS2 runtime LoRA patch：基础 GGUF 只加载一次，各 adapter 仅保存 GPT-2 投影层的 A/B 张量，并通过请求选项热切换。预编译的官方 v0.8.1 二进制不含此扩展，必须运行源码构建脚本。

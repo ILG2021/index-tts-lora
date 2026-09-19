@@ -9,13 +9,13 @@
 ```text
 integrations/audiocpp/
 ├── README.md                   本文件
-├── bin/                        audio.cpp 预编译二进制（gitignore）
+├── bin/                        audio.cpp 运行二进制（gitignore）
 │   ├── audiocpp_cli.exe        命令行推理二进制
 │   ├── audiocpp_server.exe     常驻 HTTP 服务二进制
 │   └── audiocpp_gguf.exe       GGUF 打包与量化工具
 ├── weights/                    GGUF 权重文件（gitignore）
 │   ├── base.gguf               原精度基础权重（f16）
-│   ├── base-q8_0.gguf          Q8_0 量化（推荐首选，降低 ~50% 显存且无损）
+│   ├── base-q8_0.gguf          Q8_0 量化基础权重（需在目标模型上验收音质）
 │   └── voices/                 小体积运行时 LoRA adapters
 │       └── speaker-a.safetensors
 ├── patches/
@@ -32,7 +32,7 @@ integrations/audiocpp/
 
 ## 1. 获取 audio.cpp 二进制
 
-中国大陆网络说明：audio.cpp 官方给模型权重提供了 [ModelScope 镜像](https://www.modelscope.cn/models/HereIsMark/audio.cpp-gguf)，可避免从 Hugging Face 下载 GGUF；但源码和 Windows Release 二进制目前仍由 GitHub 官方仓库发布，本项目没有发现同等的官方大陆镜像。受限网络建议在可访问 GitHub 的机器下载二进制后离线拷贝，或从源码包本地编译。
+网络来源约束：本项目禁止链接或自动访问中国大陆网站。audio.cpp 源码和 Release 二进制仅从 [GitHub 官方仓库](https://github.com/0xShug0/audio.cpp) 获取；模型脚本只使用 Hugging Face 等项目明确允许的来源。需要离线部署时，应在允许访问这些上游的环境下下载并校验，再拷贝到目标机器。
 
 ### 方案 A：下载预编译二进制（仅基础模型推理）
 
@@ -42,11 +42,18 @@ integrations/audiocpp/
 
 脚本会自动从 audio.cpp 官方 Releases 下载适配 Windows CUDA 的最新包并解压到 `integrations\audiocpp\bin\`。
 
+> **重要：**官方 audio.cpp v0.8.1 不包含本项目的 IndexTTS2 运行时 LoRA 扩展。预编译二进制不能用于 LoRA 热切换，必须使用下面的源码构建。
+
 ### 方案 B：从源码编译（LoRA 热切换必需）
 
 ```powershell
 .\integrations\audiocpp\scripts\build.ps1
 ```
+
+构建脚本固定检出 audio.cpp `v0.8.1`，幂等应用
+`patches/0001-index-tts2-runtime-lora.patch`，然后运行
+`scripts/sanitize_source.ps1` 清理不符合项目网络策略的上游链接，再生成带热切换能力的 CLI、server 和 GGUF 工具。audio.cpp 不作为本仓库的 submodule；`integrations/audiocpp/src/` 是可删除、可重建的本地构建目录，真正提交和维护的上游功能修改是 patch，网络策略清理由脚本完成。
+构建时显式设置 `AUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF`，不编译上游 server 的模型管理和网络下载功能；本项目运行时只从本地路径加载 GGUF 和 adapter。
 
 ---
 
@@ -65,7 +72,7 @@ python scripts\convert_to_gguf.py `
     --quantize-q8
 ```
 
-> `--quantize-q8` 参数会在生成 `base.gguf` 后自动额外生成 `base-q8_0.gguf`（约减少 50% 体积，显存大幅降低且音质几无损失）。
+> `--quantize-q8` 参数会在生成 `base.gguf` 后额外生成 `base-q8_0.gguf`。Q8_0 可降低权重体积和显存占用，但应先用 F16 完成 LoRA 等价性对照，再单独验收量化音质。
 
 也可以直接从 staging 权重生成 Q8_0（`audiocpp_gguf` 没有 llama-quantize 风格的 GGUF→GGUF `--quantize` 接口）：
 
@@ -87,11 +94,23 @@ python scripts\convert_lora_adapter.py `
     --output integrations\audiocpp\weights\voices\speaker-a.safetensors
 ```
 
+每个 checkpoint 转换一次，例如：
+
+```powershell
+python scripts\convert_lora_adapter.py `
+    --checkpoint trained_ckpts\speaker-b.pth `
+    --output integrations\audiocpp\weights\voices\speaker-b.safetensors
+```
+
+转换器会校验 `r`/`alpha`/`target_modules`、24 层目标投影的完整覆盖、A/B 成对关系和张量形状。缺层、重复键或不支持的目标会立即报错，不会生成部分 adapter。
+
 WebUI 的 `--lora NAME=PATH` 指向上述 `.safetensors`。桥接层只注册一个基础 model id，并把 adapter 路径作为 session options 传入；每个请求通过 `index_tts2.lora=NAME` 切换。切换会丢弃并重建 GPT prefill/decode/forward 图与 KV 状态，但不会重载基础权重或其他 IndexTTS2 组件。
 
 当前 adapter 格式是本仓库定义的 IndexTTS2 safetensors，不是 llama.cpp 的 GGUF adapter；运算结构借鉴 llama.cpp/OpenMOSS 的“基础权重 + 运行时低秩增量”，但直接接入 audio.cpp 自己的 GPT-2 GGML 图。
 
 adapter 上传到后端时使用 F16。按默认 rank 16、24 层、四个目标投影计算，每个 adapter 约占 15 MiB GPU 权重（另有少量 allocator 开销），而不是一份完整模型。切换 adapter 会重建生成图，因此首个 token 有一次图构建开销；同一 adapter 的后续请求可复用图。
+
+所有在 `--lora` 中注册的 adapter 会在 server session 创建时一次性读取并上传；请求间的“热切换”不重读文件，也不重载基础 GGUF。当前不支持 server 运行期间新增/卸载 adapter；要更改注册列表需重启 server。`base` 和 `none` 是禁用 LoRA 的保留选择，不要用作 adapter 名称。
 
 ---
 
@@ -131,6 +150,8 @@ python scripts\infer_audiocpp.py `
     --out outputs\fast.wav
 ```
 
+`infer_audiocpp.py --lora NAME=PATH` 每次只注册一个 adapter，适合单次冒烟测试；进程结束时它会关闭自己启动的 server。要验证多 LoRA 热切换，必须用下面的 WebUI/常驻 server 在同一进程中注册所有 adapter。
+
 ### 3.2 直调 audiocpp_cli.exe 原生命令行
 
 ```powershell
@@ -149,15 +170,39 @@ python scripts\infer_audiocpp.py `
 
 ## 4. 常驻服务（audiocpp_server）
 
-```powershell
-# 启动常驻服务
-.\integrations\audiocpp\bin\audiocpp_server.exe `
-    --family index_tts2 `
-    --model integrations\audiocpp\weights\base-q8_0.gguf `
-    --backend cuda `
-    --host 127.0.0.1 `
-    --port 8080
+推荐让 `AudioCppBridge`/WebUI 生成 server JSON 配置并管理进程。如果需要手工启动，先创建 `audiocpp-server.json`：
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "backend": "cuda",
+  "lazy_load": true,
+  "max_loaded_models": 1,
+  "models": [
+    {
+      "id": "index_tts2",
+      "family": "index_tts2",
+      "path": "D:/vibecoding/index-tts-lora/integrations/audiocpp/weights/base-q8_0.gguf",
+      "task": "tts",
+      "mode": "offline",
+      "session_options": {
+        "index_tts2.lora.A": "D:/vibecoding/index-tts-lora/integrations/audiocpp/weights/voices/speaker-a.safetensors",
+        "index_tts2.lora.B": "D:/vibecoding/index-tts-lora/integrations/audiocpp/weights/voices/speaker-b.safetensors"
+      }
+    }
+  ]
+}
 ```
+
+然后执行：
+
+```powershell
+.\integrations\audiocpp\bin\audiocpp_server.exe `
+    --config audiocpp-server.json
+```
+
+JSON 中建议使用绝对路径。同一 model session 一次只执行一个请求，`prepare()` 和 `run()` 在 server 的 busy guard 内串行，因此不会在两个并发请求之间交叉切换 adapter。
 
 ---
 
@@ -168,14 +213,24 @@ WebUI 前端已完全对齐 PyTorch 后端的功能，提供完整的音色参�
 ```powershell
 # 一键 PowerShell 脚本启动
 .\scripts\windows\webui_audiocpp.ps1 `
-    -Model integrations\audiocpp\weights\base-q8_0.gguf
+    -Model integrations\audiocpp\weights\base-q8_0.gguf `
+    -Lora @(
+        "A=integrations\audiocpp\weights\voices\speaker-a.safetensors",
+        "B=integrations\audiocpp\weights\voices\speaker-b.safetensors"
+    ) `
+    -Preload
 
 # 或直接运行 Python 命令：
 python webui.py `
     --backend audiocpp `
     --audiocpp-exe integrations\audiocpp\bin\audiocpp_server.exe `
-    --model integrations\audiocpp\weights\base-q8_0.gguf
+    --model integrations\audiocpp\weights\base-q8_0.gguf `
+    --lora "A=integrations\audiocpp\weights\voices\speaker-a.safetensors" `
+    --lora "B=integrations\audiocpp\weights\voices\speaker-b.safetensors" `
+    --preload
 ```
+
+`--lora` 可重复指定；界面中选择“基础模型”或 adapter 名称时，始终使用同一个 C++ server 和同一份基础 GGUF。
 
 ---
 
@@ -190,6 +245,9 @@ python webui.py `
 | `interval_silence_ms`| 请求选项 | `200` | 标点符号分段间的静音时长（毫秒） |
 | `index_tts2.mem_saver` | 会话选项 | `false` | 请求处理完成后立即释放中间暂存图，节省显存 |
 | `index_tts2.speaker_cache_slots` | 会话选项 | `1` | 说话人特征缓存槽位（复用参考音频时加速） |
+| `index_tts2.lora.NAME` | 会话选项 | 无 | 启动时注册 `NAME=adapter.safetensors` |
+| `index_tts2.lora` | 请求选项 | 空 | 当前 adapter 名称；空/`base`/`none` 禁用 LoRA |
+| `index_tts2.lora_scale` | 请求选项 | `1.0` | 运行时 LoRA 额外缩放系数（必须为有限数） |
 
 ---
 
@@ -202,4 +260,19 @@ python webui.py `
 | 权重格式 | backbone.gguf + extras.gguf | 单个 GGUF（包含全量多模块） |
 | 情感控制 | 简易控制 | 4 种模式：音色自适应 / 情感音频 / 8 维向量 / 描述文本 |
 | 推理通道 | Gradio HTTP → server | Gradio HTTP → server，并备选 CLI 直接推理 |
-| 量化支持 | llama-quantize Q4_K_M | audiocpp_gguf（IndexTTS2 已验证 Q8_0） |
+| 量化支持 | llama-quantize Q4_K_M | audiocpp_gguf Q8_0（需在目标 GPU/模型上验收） |
+
+---
+
+## 8. 提交前热切换验收
+
+验收必须在**同一个 server 进程**中完成；每次重启 CLI/server 不能证明热切换正常。固定参考音频、文本、情感参数、采样参数和 seed，至少完成：
+
+1. `base → A → B → base`，检查切回 base 后无 adapter 残留。
+2. `A → B → A`，检查两次 A 的听感、时长和内容一致；CUDA 非确定性可能使 WAV 不能逐字节相同。
+3. 循环切换 100 次，用 `nvidia-smi -l 1` 观察显存；首次建图后应趋于稳定，不应随请求数持续单调增长。
+4. 先用 F16 `base.gguf` 与 PyTorch PEFT 做对照，再测 Q8_0，避免将 LoRA 差异与量化误差混在一起。
+
+当前接口只输出 WAV，因此 PyTorch/audio.cpp 不应以“波形逐样本相同”为标准。建议同时比较音色/韵律听感、ASR 内容、时长、RMS 和 mel 频谱；若要严格定位 LoRA 数值差异，还需额外暴露 GPT logits 或 hidden-state 调试接口。
+
+> 本仓库已完成补丁适用性和静态检查，但不把它等同于目标 GPU 上的整模验收。发布生产版前应在实际模型、adapter 和部署 GPU 上执行上述测试。
