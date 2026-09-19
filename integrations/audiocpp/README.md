@@ -46,14 +46,62 @@ integrations/audiocpp/
 
 ### 方案 B：从源码编译（LoRA 热切换必需）
 
+构建依赖：
+
+- Visual Studio 2022 或 Build Tools 2022，安装“使用 C++ 的桌面开发”、MSVC v143 x64/x86 和 Windows 10/11 SDK。
+- CMake 3.20+、Git。
+- 本项目当前的 Windows CUDA 构建使用 CUDA Toolkit 12.4，默认安装路径为 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4`。
+
+推荐显式指定 Toolkit：
+
 ```powershell
-.\integrations\audiocpp\scripts\build.ps1
+.\integrations\audiocpp\scripts\build.ps1 `
+    -CudaToolkitRoot "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
 ```
+
+脚本会自动通过 `vswhere`/`VsDevCmd.bat` 加载 MSVC x64 环境，所以可以从普通 PowerShell 启动；也可以在“Developer PowerShell for VS 2022”中运行。CMake 会被明确配置为：
+
+```text
+-G "Visual Studio 17 2022" -A x64
+-T "cuda=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+```
+
+可先检查 Toolkit：
+
+```powershell
+Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\nvcc.exe"
+& "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\nvcc.exe" --version
+```
+
+`Test-Path` 应返回 `True`，`nvcc` 应显示 `release 12.4`。这里的本地 CUDA Toolkit 用于编译 audio.cpp，与 Python 训练环境中 PyTorch wheel 自带的 CUDA runtime 版本是两个独立概念。
 
 构建脚本固定检出 audio.cpp `v0.8.1`，幂等应用
 `patches/0001-index-tts2-runtime-lora.patch`，然后运行
 `scripts/sanitize_source.ps1` 清理不符合项目网络策略的上游链接，再生成带热切换能力的 CLI、server 和 GGUF 工具。audio.cpp 不作为本仓库的 submodule；`integrations/audiocpp/src/` 是可删除、可重建的本地构建目录，真正提交和维护的上游功能修改是 patch，网络策略清理由脚本完成。
 构建时显式设置 `AUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF`，不编译上游 server 的模型管理和网络下载功能；本项目运行时只从本地路径加载 GGUF 和 adapter。
+
+#### Windows 构建故障排查
+
+**`No CUDA toolset found`**
+
+这通常表示 CMake 找到了 `nvcc.exe`，但 Visual Studio generator 没有获得 CUDA Toolkit 位置。使用上面的 `-CudaToolkitRoot` 参数；不要只依赖 PATH 中的 `nvcc`。
+
+**CMake 提示 generator/toolset 与现有 cache 不一致**
+
+失败的首次配置可能在 `build-cuda` 留下没有 `-T cuda=...` 的 cache。删除的只是可重建构建目录，不包含 GGUF、LoRA 或项目源码：
+
+```powershell
+Remove-Item `
+    -LiteralPath "integrations\audiocpp\src\audio.cpp\build-cuda" `
+    -Recurse `
+    -Force
+```
+
+然后重新执行带 `-CudaToolkitRoot` 的构建命令。
+
+**提示缺少 MSVC**
+
+先确认 Visual Studio Installer 中安装了“使用 C++ 的桌面开发”。更新后的 `build.ps1` 会自动定位 VS 2022；如果仍然失败，改在“Developer PowerShell for VS 2022”中执行同一命令。
 
 ---
 

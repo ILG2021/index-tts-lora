@@ -19,6 +19,10 @@
 .PARAMETER CudaArch
     CUDA 架构（native 表示仅为当前 GPU 编译），默认 native
 
+.PARAMETER CudaToolkitRoot
+    CUDA Toolkit 根目录（例如 C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4）。
+    默认从 CUDA_PATH 或 nvcc.exe 自动推导，并作为 CMake `-T cuda=...` 传入。
+
 .EXAMPLE
     .\integrations\audiocpp\scripts\build.ps1
 #>
@@ -27,7 +31,8 @@ param(
     [string]$AudioCppDir = "",
     [string]$BuildDir = "",
     [string]$OutputDir = "",
-    [string]$CudaArch = "native"
+    [string]$CudaArch = "native",
+    [string]$CudaToolkitRoot = ""
 )
 
 Set-StrictMode -Version Latest
@@ -38,11 +43,31 @@ if (-not $AudioCppDir) { $AudioCppDir = Join-Path $ProjectRoot "integrations" "a
 if (-not $BuildDir)    { $BuildDir    = Join-Path $AudioCppDir "build-cuda" }
 if (-not $OutputDir)   { $OutputDir   = Join-Path $ProjectRoot "integrations" "audiocpp" "bin" }
 
+if (-not $CudaToolkitRoot -and $env:CUDA_PATH) {
+    $CudaToolkitRoot = $env:CUDA_PATH
+}
+if (-not $CudaToolkitRoot) {
+    $cuda124 = Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+    if (Test-Path -LiteralPath (Join-Path $cuda124 "bin\nvcc.exe")) {
+        $CudaToolkitRoot = $cuda124
+    }
+}
+if (-not $CudaToolkitRoot) {
+    $nvccCommand = Get-Command "nvcc.exe" -ErrorAction SilentlyContinue
+    if ($nvccCommand) {
+        $CudaToolkitRoot = Split-Path (Split-Path $nvccCommand.Source -Parent) -Parent
+    }
+}
+if ($CudaToolkitRoot) {
+    $CudaToolkitRoot = [System.IO.Path]::GetFullPath($CudaToolkitRoot).TrimEnd('\')
+}
+
 Write-Host "=== audio.cpp 源码编译（Windows CUDA） ===" -ForegroundColor Cyan
 Write-Host "源码目录：$AudioCppDir"
 Write-Host "构建目录：$BuildDir"
 Write-Host "输出目录：$OutputDir"
 Write-Host "CUDA 架构：$CudaArch"
+Write-Host "CUDA Toolkit：$($CudaToolkitRoot ? $CudaToolkitRoot : '未找到')"
 Write-Host ""
 
 # ── 1. 检查依赖 ───────────────────────────────────────────────────────────────
@@ -101,7 +126,10 @@ $msvcAvailable = Initialize-MsvcEnvironment
 $missing = @()
 if (-not (Test-Command "cmake"))   { $missing += "CMake 3.20+" }
 if (-not (Test-Command "git"))     { $missing += "Git" }
-if (-not (Test-Command "nvcc"))    { $missing += "CUDA Toolkit 12+" }
+if (-not (Test-Command "nvcc"))    { $missing += "CUDA Toolkit 12+ (nvcc.exe)" }
+if (-not $CudaToolkitRoot -or -not (Test-Path -LiteralPath (Join-Path $CudaToolkitRoot "bin\nvcc.exe"))) {
+    $missing += "有效的 CUDA Toolkit 根目录（可用 -CudaToolkitRoot 指定）"
+}
 if (-not $msvcAvailable) {
     $missing += "MSVC v143 x64 C++ tools (Visual Studio Build Tools 2022)"
 }
@@ -161,6 +189,9 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 $cmakeArgs = @(
     "-S", $AudioCppDir,
     "-B", $BuildDir,
+    "-G", "Visual Studio 17 2022",
+    "-A", "x64",
+    "-T", "cuda=$CudaToolkitRoot",
     "-DCMAKE_BUILD_TYPE=Release",
     "-DENGINE_ENABLE_CUDA=ON",
     "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
@@ -172,6 +203,20 @@ $cmakeArgs = @(
     # 构建产物输出到统一目录
     "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$BuildDir\bin"
 )
+
+$cachePath = Join-Path $BuildDir "CMakeCache.txt"
+if (Test-Path -LiteralPath $cachePath) {
+    $expectedToolset = "CMAKE_GENERATOR_TOOLSET:INTERNAL=cuda=$CudaToolkitRoot"
+    $cacheContent = Get-Content -LiteralPath $cachePath -Raw
+    if ($cacheContent -notmatch [regex]::Escape($expectedToolset)) {
+        throw @"
+现有 CMake cache 是用其他 CUDA toolset/生成器创建的：
+  $cachePath
+请删除构建目录后重试（不会删除源码、GGUF 或 LoRA）：
+  Remove-Item -LiteralPath `"$BuildDir`" -Recurse -Force
+"@
+    }
+}
 
 Write-Host "cmake $($cmakeArgs -join ' ')"
 & cmake @cmakeArgs
