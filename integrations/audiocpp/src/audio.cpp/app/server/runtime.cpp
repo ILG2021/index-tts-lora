@@ -918,9 +918,15 @@ std::string stream_event_json(const engine::runtime::StreamEvent & event) {
 
 const engine::runtime::AudioBuffer & select_audio_output(const engine::runtime::TaskResult & result) {
     if (result.audio_output.has_value()) {
+        if (result.audio_output->samples.empty()) {
+            throw std::runtime_error("model result contained an empty audio output");
+        }
         return *result.audio_output;
     }
     if (result.named_audio_outputs.size() == 1) {
+        if (result.named_audio_outputs.front().audio.samples.empty()) {
+            throw std::runtime_error("model result contained an empty named audio output");
+        }
         return result.named_audio_outputs.front().audio;
     }
     throw std::runtime_error("model result did not contain exactly one audio output");

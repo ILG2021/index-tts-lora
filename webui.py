@@ -454,12 +454,12 @@ if __name__ == "__main__":
 
         title = "IndexTTS2 · audio.cpp 高性能后端"
         with gr.Blocks(title=title) as demo:
-            gr.Markdown(
-                f"# {title}\n"
-                f"模型：`{Path(args.model).name}` &nbsp;|&nbsp; "
-                f"后端计算：`{args.audiocpp_backend}` &nbsp;|&nbsp; "
-                f"Server：`http://127.0.0.1:{args.audiocpp_port}`"
-            )
+            # gr.Markdown(
+            #     f"# {title}\n"
+            #     f"模型：`{Path(args.model).name}` &nbsp;|&nbsp; "
+            #     f"后端计算：`{args.audiocpp_backend}` &nbsp;|&nbsp; "
+            #     f"Server：`http://127.0.0.1:{args.audiocpp_port}`"
+            # )
             with gr.Row():
                 speaker = gr.Audio(
                     label="音色参考音频",

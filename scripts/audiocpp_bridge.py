@@ -32,12 +32,14 @@
 from __future__ import annotations
 
 import atexit
+import io
 import json
 import logging
 import subprocess
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +70,20 @@ class ServerStartupError(AudioCppBridgeError):
 
 class InferenceError(AudioCppBridgeError):
     """推理请求失败。"""
+
+
+def _validate_wav_audio(data: bytes, source: str) -> None:
+    """确认响应是至少包含一个音频帧的 WAV，而不只是空 RIFF 头。"""
+    if not data:
+        raise InferenceError(f"{source} 返回了空响应")
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wav_file:
+            if wav_file.getnframes() <= 0:
+                raise InferenceError(f"{source} 返回的 WAV 不包含音频帧")
+            if wav_file.getframerate() <= 0 or wav_file.getnchannels() <= 0:
+                raise InferenceError(f"{source} 返回的 WAV 参数无效")
+    except (EOFError, wave.Error) as exc:
+        raise InferenceError(f"{source} 返回的内容不是有效 WAV：{exc}") from exc
 
 
 class AudioCppBridge:
@@ -380,6 +396,7 @@ class AudioCppBridge:
         wav_data = out_path.read_bytes()
         if temp_out:
             out_path.unlink()
+        _validate_wav_audio(wav_data, "audiocpp_cli")
         return wav_data
 
     def generate(
@@ -433,6 +450,9 @@ class AudioCppBridge:
             request_body: dict[str, Any] = {
                 "model": self.family,
                 "input": text,
+                # /v1/audio/speech 从顶层 language 构造 Transcript；同时保留
+                # options.language 以兼容只读取 request option 的模型族。
+                "language": language,
                 "voice_ref": str(voice_ref_path),
                 "response_format": "wav",
             }
@@ -472,6 +492,7 @@ class AudioCppBridge:
             )
 
             if response.status_code == 200:
+                _validate_wav_audio(response.content, "audiocpp_server")
                 return response.content
 
             raise InferenceError(f"HTTP {response.status_code}: {response.text[:300]}")

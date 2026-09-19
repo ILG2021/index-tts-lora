@@ -24,15 +24,29 @@
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # 将 scripts/ 加入路径以便直接导入桥接层
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _test_wav_bytes(frames: int = 16) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16000)
+        wav_file.writeframes(b"\x00\x00" * frames)
+    return buffer.getvalue()
+
+
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 # ── 常量：集成测试所需路径 ──────────────────────────────────────────────────
@@ -243,7 +257,7 @@ class TestLoraSwitching(unittest.TestCase):
             with patch.object(bridge, "_ensure_running"), patch("requests.post") as mock_post:
                 mock_resp = MagicMock()
                 mock_resp.status_code = 200
-                mock_resp.content = b"RIFFfake"
+                mock_resp.content = _test_wav_bytes()
                 mock_post.return_value = mock_resp
 
                 import json
@@ -255,6 +269,7 @@ class TestLoraSwitching(unittest.TestCase):
                 self.assertTrue(mock_post.called)
                 req_json = mock_post.call_args[1]["json"]
                 self.assertEqual(req_json["model"], "index_tts2")
+                self.assertEqual(req_json["language"], "zh")
                 # 切换为 speaker-a
                 bridge.generate(
                     text="测试 LoRA",
@@ -264,6 +279,37 @@ class TestLoraSwitching(unittest.TestCase):
                 req_json2 = mock_post.call_args[1]["json"]
                 self.assertEqual(req_json2["model"], "index_tts2")
                 self.assertEqual(req_json2["options"]["index_tts2.lora"], "speaker-a")
+        finally:
+            bridge.shutdown()
+
+    def test_empty_server_wav_falls_back_to_cli(self):
+        """HTTP 200 但 WAV 无音频帧时，应改走 CLI，不能交给 WebUI 播放 0:00。"""
+        bridge = self.BridgeClass(
+            server_exe=self.fake_exe.name,
+            model_path=self.fake_model.name,
+        )
+        bridge.cli_exe = Path(self.fake_exe.name)
+        empty_wav = _test_wav_bytes(frames=0)
+        valid_wav = _test_wav_bytes()
+        try:
+            with (
+                patch.object(bridge, "_ensure_running"),
+                patch.object(bridge, "generate_via_cli", return_value=valid_wav) as fallback,
+                patch("requests.post") as mock_post,
+            ):
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                mock_resp.content = empty_wav
+                mock_post.return_value = mock_resp
+
+                result = bridge.generate(
+                    text="测试空音频回退",
+                    voice_ref=self.fake_model.name,
+                    language="zh",
+                )
+
+                self.assertEqual(result, valid_wav)
+                fallback.assert_called_once()
         finally:
             bridge.shutdown()
 

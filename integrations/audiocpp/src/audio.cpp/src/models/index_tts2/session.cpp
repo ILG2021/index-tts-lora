@@ -750,6 +750,9 @@ runtime::AudioBuffer IndexTTS2Session::synthesize_segment(
     if (mem_saver_) {
         vocoder_->release_runtime_graph();
     }
+    if (audio.waveform.empty()) {
+        throw std::runtime_error("IndexTTS2 vocoder produced no waveform samples");
+    }
     runtime::AudioBuffer out;
     out.sample_rate = audio.sample_rate;
     out.channels = 1;
@@ -808,6 +811,9 @@ runtime::TaskResult IndexTTS2Session::run(const runtime::TaskRequest & request) 
             segment_lang_ids.push_back(lang_id);
         }
     }
+    if (segment_token_ids.empty()) {
+        throw std::runtime_error("IndexTTS2 tokenizer produced no text segments");
+    }
 
     runtime::AudioBuffer merged;
     for (size_t i = 0; i < segment_token_ids.size(); ++i) {
@@ -823,6 +829,9 @@ runtime::TaskResult IndexTTS2Session::run(const runtime::TaskRequest & request) 
             parsed.generation,
             parsed.generation.seed + static_cast<uint32_t>(i));
         runtime::append_audio_buffer(merged, segment_audio);
+    }
+    if (merged.samples.empty()) {
+        throw std::runtime_error("IndexTTS2 synthesis produced an empty audio buffer");
     }
 
     runtime::TaskResult result;
