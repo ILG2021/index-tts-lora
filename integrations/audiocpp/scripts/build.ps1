@@ -48,15 +48,73 @@ Write-Host ""
 # ── 1. 检查依赖 ───────────────────────────────────────────────────────────────
 function Test-Command { param($cmd); return (Get-Command $cmd -ErrorAction SilentlyContinue) -ne $null }
 
+# 普通 PowerShell 不会自动加载 MSVC 环境。先尝试通过 vswhere/VsDevCmd
+# 定位已安装的 VS 2022 C++ 工具链，避免要求用户必须从
+# "Developer PowerShell for VS 2022" 启动。
+function Initialize-MsvcEnvironment {
+    if ((Test-Command "cl.exe") -or (Test-Command "clang-cl.exe")) { return $true }
+
+    $vswhereCandidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"),
+        (Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe")
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+    $installPath = $null
+    foreach ($vswhere in $vswhereCandidates) {
+        $candidate = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath 2>$null
+        if ($LASTEXITCODE -eq 0 -and $candidate) {
+            $installPath = ($candidate | Select-Object -First 1).Trim()
+            break
+        }
+    }
+
+    if (-not $installPath) {
+        $editionRoots = @("BuildTools", "Community", "Professional", "Enterprise")
+        foreach ($edition in $editionRoots) {
+            $candidate = Join-Path $env:ProgramFiles "Microsoft Visual Studio\2022\$edition"
+            if (Test-Path -LiteralPath (Join-Path $candidate "Common7\Tools\VsDevCmd.bat")) {
+                $installPath = $candidate
+                break
+            }
+        }
+    }
+    if (-not $installPath) { return $false }
+
+    $devCmd = Join-Path $installPath "Common7\Tools\VsDevCmd.bat"
+    if (-not (Test-Path -LiteralPath $devCmd)) { return $false }
+
+    Write-Host "加载 Visual Studio C++ 开发环境：$installPath" -ForegroundColor Gray
+    $environmentLines = & $env:ComSpec /d /s /c `
+        "`"$devCmd`" -no_logo -arch=x64 -host_arch=x64 && set" 2>$null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    foreach ($line in $environmentLines) {
+        if ($line -match '^([^=]+)=(.*)$') {
+            [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+        }
+    }
+    return (Test-Command "cl.exe") -or (Test-Command "clang-cl.exe")
+}
+
+$msvcAvailable = Initialize-MsvcEnvironment
 $missing = @()
 if (-not (Test-Command "cmake"))   { $missing += "CMake 3.20+" }
 if (-not (Test-Command "git"))     { $missing += "Git" }
 if (-not (Test-Command "nvcc"))    { $missing += "CUDA Toolkit 12+" }
-if (-not (Test-Command "cl.exe") -and -not (Test-Command "clang-cl.exe")) {
-    $missing += "MSVC (Visual Studio 2022)"
+if (-not $msvcAvailable) {
+    $missing += "MSVC v143 x64 C++ tools (Visual Studio Build Tools 2022)"
 }
 if ($missing.Count -gt 0) {
-    Write-Error "缺少以下依赖：`n  $($missing -join "`n  ")`n请安装后重试。"
+    $detail = $missing -join "`n - "
+    throw @"
+缺少以下构建依赖：
+ - $detail
+
+如果缺少 MSVC，请在 Visual Studio Installer 中安装“使用 C++ 的桌面开发”，
+并确保包含 MSVC v143 x64/x86、Windows 10/11 SDK 和 C++ CMake tools。
+安装后可直接重跑本脚本，也可从“Developer PowerShell for VS 2022”运行。
+"@
 }
 
 # ── 2. 克隆（若不存在） ───────────────────────────────────────────────────────
