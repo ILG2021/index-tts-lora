@@ -245,12 +245,15 @@ def build_demo() -> gr.Blocks:
             "使用 IndexTTS2 v2 原生情感控制与生成参数；启动时可加载基础模型或 LoRA。"
         )
         with gr.Row():
-            speaker = gr.Audio(
-                label="音色参考音频",
-                sources=["upload", "microphone"],
-                type="filepath",
-            )
-            result = gr.Audio(label="生成结果", type="filepath")
+            with gr.Column():
+                speaker = gr.Audio(
+                    label="音色参考音频",
+                    sources=["upload", "microphone"],
+                    type="filepath",
+                )
+            with gr.Column():
+                result = gr.Audio(label="生成结果", type="filepath")
+                generate = gr.Button("生成语音", variant="primary")
         text = gr.TextArea(label="目标文本", lines=5, placeholder="请输入需要合成的文本")
 
         with gr.Accordion("IndexTTS2 情感控制", open=True):
@@ -314,7 +317,6 @@ def build_demo() -> gr.Blocks:
                     0, 2000, 200, step=10, label="分段静音（毫秒）"
                 )
 
-        generate = gr.Button("生成语音", variant="primary")
         generate.click(
             synthesize,
             inputs=[
@@ -461,12 +463,15 @@ if __name__ == "__main__":
             #     f"Server：`http://127.0.0.1:{args.audiocpp_port}`"
             # )
             with gr.Row():
-                speaker = gr.Audio(
-                    label="音色参考音频",
-                    sources=["upload", "microphone"],
-                    type="filepath",
-                )
-                result = gr.Audio(label="生成结果", type="filepath")
+                with gr.Column():
+                    speaker = gr.Audio(
+                        label="音色参考音频",
+                        sources=["upload", "microphone"],
+                        type="filepath",
+                    )
+                with gr.Column():
+                    result = gr.Audio(label="生成结果", type="filepath")
+                    generate_btn = gr.Button("生成语音", variant="primary")
 
             text = gr.TextArea(label="目标文本", lines=5, placeholder="请输入需要合成的文本")
 
@@ -539,7 +544,6 @@ if __name__ == "__main__":
                     max_mel_tokens = gr.Slider(50, 3000, 1500, step=50, label="最大 mel token")
                     interval_silence = gr.Slider(0, 2000, 200, step=10, label="分段静音（毫秒）")
 
-            generate_btn = gr.Button("生成语音", variant="primary")
             generate_btn.click(
                 _synthesize_audiocpp,
                 inputs=[
