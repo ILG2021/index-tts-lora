@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import io
 import json
 import logging
@@ -59,6 +60,8 @@ _INFO_ENDPOINT = "/v1/models"
 _DEFAULT_STARTUP_TIMEOUT = 60
 # 健康检查轮询间隔（秒）
 _HEALTH_POLL_INTERVAL = 0.5
+# audio.cpp /v1/audio/speech 对内联 voice_ref 的上限。
+_MAX_INLINE_VOICE_REF_BYTES = 5 * 1024 * 1024
 
 
 class AudioCppBridgeError(RuntimeError):
@@ -103,6 +106,18 @@ def _stage_audio_ascii(source: Path) -> Path:
         staged.unlink(missing_ok=True)
         raise
     return staged
+
+
+def _server_voice_ref(source: Path) -> tuple[dict[str, str] | str, Path | None]:
+    """优先内联参考 WAV；过大时退回 ASCII 临时路径。"""
+    audio_bytes = source.read_bytes()
+    if len(audio_bytes) <= _MAX_INLINE_VOICE_REF_BYTES:
+        return {
+            "type": "base64",
+            "data": base64.b64encode(audio_bytes).decode("ascii"),
+        }, None
+    staged = _stage_audio_ascii(source)
+    return str(staged), staged
 
 
 class AudioCppBridge:
@@ -479,7 +494,7 @@ class AudioCppBridge:
             if not emo_path.is_file():
                 raise ValueError(f"情感参考音频不存在：{emo_path}")
 
-        staged_voice_ref = _stage_audio_ascii(voice_ref_path)
+        voice_ref_payload, staged_voice_ref = _server_voice_ref(voice_ref_path)
         staged_emo_path = _stage_audio_ascii(emo_path) if emo_path else None
 
         try:
@@ -491,7 +506,7 @@ class AudioCppBridge:
                 # /v1/audio/speech 从顶层 language 构造 Transcript；同时保留
                 # options.language 以兼容只读取 request option 的模型族。
                 "language": language,
-                "voice_ref": str(staged_voice_ref),
+                "voice_ref": voice_ref_payload,
                 "response_format": "wav",
             }
 
@@ -565,7 +580,8 @@ class AudioCppBridge:
                 )
             raise InferenceError(f"audiocpp 推理失败：{e}") from e
         finally:
-            staged_voice_ref.unlink(missing_ok=True)
+            if staged_voice_ref:
+                staged_voice_ref.unlink(missing_ok=True)
             if staged_emo_path:
                 staged_emo_path.unlink(missing_ok=True)
 

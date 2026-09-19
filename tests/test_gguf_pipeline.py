@@ -271,6 +271,7 @@ class TestLoraSwitching(unittest.TestCase):
                 req_json = mock_post.call_args[1]["json"]
                 self.assertEqual(req_json["model"], "index_tts2")
                 self.assertEqual(req_json["language"], "zh")
+                self.assertEqual(req_json["voice_ref"]["type"], "base64")
                 # 切换为 speaker-a
                 bridge.generate(
                     text="测试 LoRA",
