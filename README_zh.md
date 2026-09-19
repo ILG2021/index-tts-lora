@@ -287,7 +287,7 @@ WebUI 是**推理界面**，不是训练界面；训练通过命令行完成。�
 
 ## 9. audio.cpp / GGUF 推理
 
-完整流程见 [integrations/audiocpp/README.md](integrations/audiocpp/README.md)。audio.cpp 源码和发行二进制从 GitHub 获取，模型权重仅使用本项目明确允许的来源。本项目给 audio.cpp v0.8.1 应用 IndexTTS2 runtime LoRA patch：基础 GGUF 只加载一次，各 adapter 仅保存 GPT-2 投影层的 A/B 张量，并通过请求选项热切换。预编译的官方 v0.8.1 二进制不含此扩展，必须运行源码构建脚本。
+完整流程见 [integrations/audiocpp/README.md](integrations/audiocpp/README.md)。本仓库直接维护 audio.cpp v0.8.1 源码，不使用 submodule 或构建时 patch。内置源码已集成 IndexTTS2 runtime LoRA：基础 GGUF 只加载一次，各 adapter 仅保存 GPT-2 投影层的 A/B 张量，并通过请求选项热切换。预编译的官方 v0.8.1 二进制不含此扩展，必须编译仓库内置源码。
 
 Windows 下编译 LoRA 热切换版 audio.cpp 需要 Visual Studio 2022 C++ 工具链和本地 CUDA Toolkit 12.4。如果 CMake 报 `No CUDA toolset found`，使用：
 

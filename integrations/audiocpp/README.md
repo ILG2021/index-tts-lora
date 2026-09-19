@@ -18,9 +18,7 @@ integrations/audiocpp/
 │   ├── base-q8_0.gguf          Q8_0 量化基础权重（需在目标模型上验收音质）
 │   └── voices/                 小体积运行时 LoRA adapters
 │       └── speaker-a.safetensors
-├── patches/
-│   ├── 0001-index-tts2-runtime-lora.patch
-│   └── 0002-msvc-utf8.patch       MSVC 统一以 UTF-8 解析 C++ 源码
+├── src/audio.cpp/               内置 audio.cpp v0.8.1 源码（已直接集成 LoRA 修改）
 ├── configs/
 │   └── default.yaml            audiocpp_server 常用参数与 IndexTTS2 选项
 └── scripts/
@@ -76,9 +74,7 @@ Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\nvcc.exe
 
 `Test-Path` 应返回 `True`，`nvcc` 应显示 `release 12.4`。这里的本地 CUDA Toolkit 用于编译 audio.cpp，与 Python 训练环境中 PyTorch wheel 自带的 CUDA runtime 版本是两个独立概念。
 
-构建脚本固定检出 audio.cpp `v0.8.1`，幂等应用
-`patches/0001-index-tts2-runtime-lora.patch` 和 `patches/0002-msvc-utf8.patch`，然后运行
-`scripts/sanitize_source.ps1` 清理不符合项目网络策略的上游链接，再生成带热切换能力的 CLI、server 和 GGUF 工具。audio.cpp 不作为本仓库的 submodule；`integrations/audiocpp/src/` 是可删除、可重建的本地构建目录，真正提交和维护的上游功能修改是 patch，网络策略清理由脚本完成。
+仓库直接维护 audio.cpp `v0.8.1` 源码和 IndexTTS2 runtime LoRA 修改，不再使用 submodule、构建时 clone 或 patch 应用流程。`build.ps1` 直接编译 `integrations/audiocpp/src/audio.cpp/`，并运行 `scripts/sanitize_source.ps1` 重新检查源码网络策略。只有 `build-cuda/` 等构建产物是可删除、可重建的。
 构建时显式设置 `AUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF`，不编译上游 server 的模型管理和网络下载功能；本项目运行时只从本地路径加载 GGUF 和 adapter。
 
 #### Windows 构建故障排查
@@ -106,7 +102,7 @@ Remove-Item `
 
 **`text_normalization.cpp` 在中文标点附近报 C2015/C2017/C2001**
 
-这是 MSVC 使用系统代码页解析 UTF-8 C++ 源码导致的级联语法错误，与 CUDA 和 LoRA 计算无关。上游只给 `engine_runtime` 加了 `/utf-8`，但 `text_normalization.cpp` 由 `engine_core` object target 编译。本项目的 `0002-msvc-utf8.patch` 在全局 MSVC C++ 编译选项中加入 `/utf-8`。拉取最新项目修改后重新运行 `build.ps1` 即可，不需要修改该 C++ 文件中的中文标点。
+这是 MSVC 使用系统代码页解析 UTF-8 C++ 源码导致的级联语法错误，与 CUDA 和 LoRA 计算无关。上游只给 `engine_runtime` 加了 `/utf-8`，但 `text_normalization.cpp` 由 `engine_core` object target 编译。内置源码已在全局 MSVC C++ 编译选项中加入 `/utf-8`，不需要修改该 C++ 文件中的中文标点。
 
 ---
 
@@ -139,7 +135,7 @@ python scripts\convert_to_gguf.py `
 
 ### 2.2 LoRA 转换为运行时 adapter
 
-本仓库的 audio.cpp v0.8.1 patch 在 GPT-2 的 `c_attn`、`c_proj` 和 `c_fc` 图中加入低秩分支。基础 GGUF 常驻且不改写，每个 adapter 只保存 A/B 张量；`alpha/r` 在转换时折入 B，请求仍可额外指定 scale：
+本仓库内置的 audio.cpp v0.8.1 源码在 GPT-2 的 `c_attn`、`c_proj` 和 `c_fc` 图中加入低秩分支。基础 GGUF 常驻且不改写，每个 adapter 只保存 A/B 张量；`alpha/r` 在转换时折入 B，请求仍可额外指定 scale：
 
 ```powershell
 python scripts\convert_lora_adapter.py `
@@ -328,4 +324,4 @@ python webui.py `
 
 当前接口只输出 WAV，因此 PyTorch/audio.cpp 不应以“波形逐样本相同”为标准。建议同时比较音色/韵律听感、ASR 内容、时长、RMS 和 mel 频谱；若要严格定位 LoRA 数值差异，还需额外暴露 GPT logits 或 hidden-state 调试接口。
 
-> 本仓库已完成补丁适用性和静态检查，但不把它等同于目标 GPU 上的整模验收。发布生产版前应在实际模型、adapter 和部署 GPU 上执行上述测试。
+> 本仓库已完成内置源码和构建脚本的静态检查，但不把它等同于目标 GPU 上的整模验收。发布生产版前应在实际模型、adapter 和部署 GPU 上执行上述测试。

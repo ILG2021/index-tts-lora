@@ -4,11 +4,10 @@
     从源码编译 audio.cpp（进阶，需要 CMake 3.20+ 和 CUDA Toolkit 12+）。
 
 .DESCRIPTION
-    克隆 audio.cpp 仓库并在 CUDA 模式下编译。
-    推荐先尝试 download_audiocpp.ps1（预编译二进制）。
+    编译仓库内置、已应用 IndexTTS2 LoRA 修改的 audio.cpp v0.8.1 源码。
 
 .PARAMETER AudioCppDir
-    audio.cpp 源码克隆目录，默认 integrations\audiocpp\src\audio.cpp
+    仓库内置 audio.cpp 源码目录，默认 integrations\audiocpp\src\audio.cpp
 
 .PARAMETER BuildDir
     CMake 构建目录，默认 integrations\audiocpp\src\audio.cpp\build-cuda
@@ -125,7 +124,6 @@ function Initialize-MsvcEnvironment {
 $msvcAvailable = Initialize-MsvcEnvironment
 $missing = @()
 if (-not (Test-Command "cmake"))   { $missing += "CMake 3.20+" }
-if (-not (Test-Command "git"))     { $missing += "Git" }
 if (-not (Test-Command "nvcc"))    { $missing += "CUDA Toolkit 12+ (nvcc.exe)" }
 if (-not $CudaToolkitRoot -or -not (Test-Path -LiteralPath (Join-Path $CudaToolkitRoot "bin\nvcc.exe"))) {
     $missing += "有效的 CUDA Toolkit 根目录（可用 -CudaToolkitRoot 指定）"
@@ -146,33 +144,19 @@ if ($missing.Count -gt 0) {
 }
 
 # ── 2. 克隆（若不存在） ───────────────────────────────────────────────────────
-if (-not (Test-Path $AudioCppDir)) {
-    Write-Host "克隆 audio.cpp v0.8.1 仓库..." -ForegroundColor Yellow
-    git clone --depth 1 --branch v0.8.1 https://github.com/0xShug0/audio.cpp.git $AudioCppDir
-    Write-Host "克隆完成"
-} else {
-    Write-Host "源码目录已存在，跳过克隆（如需更新请手动 git pull）"
+if (-not (Test-Path -LiteralPath (Join-Path $AudioCppDir "CMakeLists.txt"))) {
+    throw "缺少仓库内置 audio.cpp 源码：$AudioCppDir"
 }
 
 # ── 2.1 应用 IndexTTS2 runtime LoRA 扩展 ─────────────────────────────────────
-$PatchDir = Join-Path $ProjectRoot "integrations" "audiocpp" "patches"
-$Patches = @(
-    (Join-Path $PatchDir "0001-index-tts2-runtime-lora.patch"),
-    (Join-Path $PatchDir "0002-msvc-utf8.patch")
+$RequiredSourceFiles = @(
+    (Join-Path $AudioCppDir "src\models\index_tts2\gpt.cpp"),
+    (Join-Path $AudioCppDir "src\models\index_tts2\session.cpp"),
+    (Join-Path $AudioCppDir "include\engine\models\index_tts2\gpt.h")
 )
-foreach ($Patch in $Patches) {
-    if (-not (Test-Path $Patch)) { Write-Error "缺少 audio.cpp patch：$Patch" }
-    & git -C $AudioCppDir apply --check $Patch 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        & git -C $AudioCppDir apply $Patch
-        if ($LASTEXITCODE -ne 0) { Write-Error "应用 audio.cpp patch 失败：$Patch" }
-        Write-Host "已应用 $([System.IO.Path]::GetFileName($Patch))" -ForegroundColor Green
-    } else {
-        & git -C $AudioCppDir apply --reverse --check $Patch 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "audio.cpp 源码既不能应用也不包含 patch：$Patch`n请确认使用 v0.8.1 干净源码"
-        }
-        Write-Host "$([System.IO.Path]::GetFileName($Patch)) 已存在，跳过" -ForegroundColor Gray
+foreach ($SourceFile in $RequiredSourceFiles) {
+    if (-not (Test-Path -LiteralPath $SourceFile)) {
+        throw "缺少仓库内置 audio.cpp 源文件：$SourceFile"
     }
 }
 
@@ -198,6 +182,10 @@ $cmakeArgs = @(
     "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
     # 禁止编译上游模型管理/网络下载能力；本项目只加载本地 GGUF/adapter
     "-DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF",
+    "-DAUDIOCPP_BUILD_C_API=OFF",
+    "-DENGINE_BUILD_TESTS=OFF",
+    "-DENGINE_BUILD_EXTENDED_TESTS=OFF",
+    "-DENGINE_BUILD_MODEL_TESTS=OFF",
     # 只编译 core + index_tts2，减少编译时间
     "-DAUDIOCPP_MODEL_SET=custom",
     "-DAUDIOCPP_MODELS=index_tts2",
@@ -235,7 +223,14 @@ Write-Host ""
 Write-Host "复制产物到 $OutputDir..." -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
-$BuiltBinDir = Join-Path $BuildDir "bin"
+$BuiltBinCandidates = @(
+    (Join-Path $BuildDir "bin\Release"),
+    (Join-Path $BuildDir "bin")
+)
+$BuiltBinDir = $BuiltBinCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $BuiltBinDir) {
+    throw "编译完成但未找到产物目录：$($BuiltBinCandidates -join ', ')"
+}
 @("audiocpp_cli.exe", "audiocpp_server.exe", "audiocpp_gguf.exe") | ForEach-Object {
     $src = Join-Path $BuiltBinDir $_
     if (Test-Path $src) {
