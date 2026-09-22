@@ -55,7 +55,7 @@ D:\datasets\LJSpeech-1.1\
 .\scripts\windows\prepare_ljspeech.ps1 -DatasetDir "D:\datasets\LJSpeech-1.1"
 ```
 
-Windows 脚本默认按中文数据运行（`-Language zh`），日志应显示 `Preprocessing [zh]`。英文或日文数据可显式传入 `-Language en` 或 `-Language ja`。脚本开始时会检查基础模型和辅助模型，缺失或下载不完整时自动补下载。
+Windows 脚本默认按中文数据运行（`-Language zh`），日志应显示 `Preprocessing [zh]`。英文或日文数据可显式传入 `-Language en` 或 `-Language ja`。若数据第一列包含子目录（如长音频切片按文件夹组织：`chapter_01/001.wav`），可附加 `-SpeakerFromFolder` 开关，将子文件夹作为发音人标识，确保 Prompt/Target 仅在同一文件夹内部采样。脚本开始时会检查基础模型和辅助模型，缺失或下载不完整时自动补下载。
 
 流程依次执行：
 
@@ -219,7 +219,7 @@ speaker_b/session_01/file0002.wav|另一段文本
 
 JSONL 的 `speaker` 是配对用的说话人分组 ID，不是声音嵌入，也不需要旧版 `speaker_info`。单说话人可以统一使用 `ljspeech`；多说话人必须分别标注真实 ID。配对不会跨说话人，也不会将同一条音频同时作为自身的 prompt 和 target。
 
-默认约 1% 数据按 ID 哈希分到验证集。**每个需要参与配对的说话人，在对应 split 中至少要有两条有效音频**；两条原始数据不代表能完成训练。小数据集可能产生空验证集，此时应换新的输出目录，提高 `--val-ratio`（例如 `0.1`）并检查拆分结果，再分别生成配对文件。不能通过复制训练配对到验证集解决。预处理使用 `--batch-size 1`，目前拒绝变长音频的批量特征提取，避免把 padding 当作真实语义码保存。
+默认固定选取 10 条数据（由 `--seed` 随机抽样）分到验证集，可通过 `--val-count` 调整。**每个需要参与配对的说话人，在对应 split 中至少要有两条有效音频**；两条原始数据不代表能完成训练。如果验证集为空，此时应换新的输出目录，指定合适的 `--val-count` 并检查拆分结果，再分别生成配对文件。不能通过复制训练配对到验证集解决。预处理使用 `--batch-size 1`，目前拒绝变长音频的批量特征提取，避免把 padding 当作真实语义码保存。
 
 重新预处理时已有 ID 保持原来的 train/val 归属。修改文本、模型、分词器、说话人或拆分比例后，应使用全新的 `--output-dir`，避免旧特征、旧 manifest 混入。`--skip-existing` 仅用于同一份输入及同一套模型下的断点续提，不验证文件内容哈希。
 

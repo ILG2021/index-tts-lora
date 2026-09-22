@@ -124,8 +124,13 @@ def main() -> None:
                 continue
             if not text:
                 continue
+            if len(relative_audio.parts) > 1:
+                speaker = relative_audio.parent.as_posix()
+            else:
+                speaker = args.speaker
+
             records.append({"id": sample_id, "text": text, "audio": str(audio),
-                            "speaker": args.speaker, "language": args.language,
+                            "speaker": speaker, "language": args.language,
                             "duration": round(wav_duration(audio), 6)})
     if len(records) < 2:
         raise RuntimeError("Fewer than two usable samples were found.")

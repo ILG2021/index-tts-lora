@@ -78,14 +78,27 @@ def update_stats_file(
         json.dump(stats, stats_f, indent=2, ensure_ascii=False)
 
 
-def assign_to_validation(sample_id: str, ratio: float) -> bool:
-    if ratio <= 0.0:
-        return False
-    if ratio >= 1.0:
-        return True
-    digest = hashlib.sha1(sample_id.encode("utf-8")).hexdigest()
-    value = int(digest, 16) % 1_000_000
-    return (value / 1_000_000) < ratio
+def select_validation_ids(manifest_path: Path, val_count: int, seed: int) -> set[str]:
+    if val_count <= 0:
+        return set()
+    ids: List[str] = []
+    seen: set[str] = set()
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            uid = rec.get("id")
+            if uid and uid not in seen:
+                seen.add(uid)
+                ids.append(uid)
+    rng = random.Random(seed)
+    rng.shuffle(ids)
+    return set(ids[:val_count])
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,10 +164,10 @@ def parse_args() -> argparse.Namespace:
         help="Computation device (cuda or cpu).",
     )
     parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.01,
-        help="Fraction of data reserved for validation.",
+        "--val-count",
+        type=int,
+        default=10,
+        help="Fixed number of samples reserved for validation (default: 10).",
     )
     parser.add_argument(
         "--seed",
@@ -496,6 +509,8 @@ def preprocess_dataset(
     if train_ids & val_ids:
         raise ValueError("Existing train/validation manifests overlap; use a fresh output directory.")
 
+    target_val_ids = select_validation_ids(manifest_path, args.val_count, args.seed)
+
     train_file = open(train_manifest_path, "a", encoding="utf-8")
     val_file = open(val_manifest_path, "a", encoding="utf-8")
 
@@ -541,7 +556,7 @@ def preprocess_dataset(
             pending = pending[limit:]
             for entry in entries:
                 is_val = entry["id"] in val_ids or (
-                    entry["id"] not in train_ids and assign_to_validation(entry["id"], args.val_ratio)
+                    entry["id"] not in train_ids and entry["id"] in target_val_ids
                 )
                 if is_val:
                     if entry["id"] not in val_ids:
@@ -608,8 +623,8 @@ def main() -> None:
     np.random.seed(args.seed)
     if args.batch_size != 1:
         raise ValueError("Use --batch-size 1: variable-length semantic code batching is not supported safely.")
-    if not 0 < args.val_ratio < 1:
-        raise ValueError("val-ratio must be between 0 and 1.")
+    if args.val_count < 0:
+        raise ValueError("val-count must be non-negative.")
     batch_size = 1
 
     output_root = args.output_root.expanduser().resolve() if args.output_root else None
@@ -679,8 +694,8 @@ def main() -> None:
                 executor,
             )
             summaries.append((lang, processed, skipped, train_count, val_count))
-            if train_count == 0 or val_count == 0:
-                raise RuntimeError("Empty train/validation split. Check skipped audio and use a fresh output directory with a suitable --val-ratio.")
+            if train_count == 0 or (args.val_count > 0 and val_count == 0):
+                raise RuntimeError("Empty train/validation split. Check skipped audio and use a fresh output directory with a suitable --val-count.")
     finally:
         if executor is not None:
             executor.shutdown(wait=True)

@@ -154,6 +154,45 @@ class ConversionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(output.read_bytes(), previous)
 
+    def test_speaker_from_folder_derives_subfolder_as_speaker(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            nested1 = root / "wavs" / "chapter_01"
+            nested2 = root / "wavs" / "chapter_02"
+            nested1.mkdir(parents=True)
+            nested2.mkdir(parents=True)
+            write_wav(nested1 / "001.wav")
+            write_wav(nested1 / "002.wav")
+            write_wav(nested2 / "001.wav")
+            metadata = root / "metadata.csv"
+            metadata.write_text(
+                "chapter_01/001.wav|text one\n"
+                "chapter_01/002.wav|text two\n"
+                "chapter_02/001.wav|text three\n",
+                encoding="utf-8",
+            )
+            output = root / "voice.jsonl"
+            command_default = [
+                sys.executable, str(SCRIPT), "--dataset-dir", str(root),
+                "--output", str(output),
+            ]
+            result = subprocess.run(command_default, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            rows_default = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+            for r in rows_default:
+                self.assertEqual(r["speaker"], "ljspeech")
+
+            command_folder = [
+                sys.executable, str(SCRIPT), "--dataset-dir", str(root),
+                "--output", str(output), "--speaker-from-folder",
+            ]
+            result = subprocess.run(command_folder, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            rows_folder = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(rows_folder[0]["speaker"], "chapter_01")
+            self.assertEqual(rows_folder[1]["speaker"], "chapter_01")
+            self.assertEqual(rows_folder[2]["speaker"], "chapter_02")
+
 
 if __name__ == "__main__":
     unittest.main()
